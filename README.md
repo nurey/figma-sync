@@ -10,8 +10,8 @@ Hidden frames and separator pages (pages named only with dashes or spaces) are s
 ## Prerequisites
 
 - macOS or Linux.
-- Ruby 3.3+, via rbenv or Homebrew: `ruby --version`. Only the standard library is used, so there are no gems to install.
-- A Figma personal access token with the `File content: read` scope. Generate one at https://www.figma.com/developers/api#access-tokens.
+- Ruby 3.3+, via rbenv or Homebrew: `ruby --version`. Only the standard library is used, so running it needs no gems (the tests use RSpec).
+- A Figma personal access token. Generate one at <https://www.figma.com/settings> (Security → Personal access tokens → Generate new token), with the `File content: read` scope; the scopes are documented at <https://www.figma.com/developers/api#access-tokens>.
 
 ## Store the token
 
@@ -97,3 +97,9 @@ Don't point `--out` directly at `~/Library/CloudStorage/...`: macOS TCC blocks p
 - **`No Figma token`**: none of `--token`, `FIGMA_TOKEN` or the keychain item gave a token. Under launchd, only the keychain item applies.
 - **`contains whitespace or control characters`**: the stored token has a stray newline or space in it. Store it again.
 - **Some frames failed**: they are listed at the end and the exit status is 1. The manifest's `version` is left unset, so the next run retries instead of reporting `Up to date`.
+
+## Run the tests
+
+```bash
+bundle install && bundle exec rspec
+```
