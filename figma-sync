@@ -22,7 +22,7 @@ module FigmaSync
   URL_KEY = %r{figma\.com/(?:design|file)/([A-Za-z0-9]+)}
   NO_TOKEN = 'No Figma token. Set FIGMA_TOKEN, pass --token, or store one (security prompts for it): ' \
              'security add-generic-password -s figma-token -a "$USER" -U -w'
-  MALFORMED_TOKEN = 'The Figma token contains whitespace or control characters; store it again without them'
+  MALFORMED_TOKEN = 'The Figma token contains whitespace, control or non-ASCII characters; store it again without them'
 
   class SyncError < StandardError; end
   class AuthError < SyncError; end
@@ -53,7 +53,7 @@ module FigmaSync
       client = Client.new(resolve_token(options[:token]))
 
       meta = client.get_file(key, depth: 1)
-      out = options[:out] ? expand_user(options[:out]) : File.join(Dir.home, 'Figma', sanitize(meta['name']))
+      out = options[:out] ? expand_user(options[:out]) : File.join(home_dir, 'Figma', sanitize(meta['name']))
       previous = File.exist?(out) ? load_manifest(out) : nil
       if previous && previous['fileKey'] != key
         raise SyncError, "#{display_path(out)} is synced from file #{previous['fileKey']}, not #{key}"
@@ -233,7 +233,7 @@ module FigmaSync
       end
 
       begin
-        rest = parser.parse(argv)
+        rest = parser.parse(argv.map { utf8(_1) })
         raise OptionParser::MissingArgument, 'FILE' if rest.empty?
         raise OptionParser::NeedlessArgument, rest.drop(1).join(' ') if rest.size > 1
       rescue OptionParser::ParseError => e
@@ -248,31 +248,50 @@ module FigmaSync
       warn(msg)
     end
 
+    def utf8(string)
+      string.dup.force_encoding(Encoding::UTF_8)
+    end
+
+    def home_dir
+      utf8(Dir.home)
+    end
+
+    def absolute_path(path, base = utf8(Dir.pwd))
+      File.expand_path(path, base)
+    end
+
     def expand_user(path)
-      path.start_with?('~') ? File.expand_path(path) : path
+      return path unless path.start_with?('~')
+      return path.sub('~') { home_dir } if path == '~' || path.start_with?('~/')
+
+      utf8(File.expand_path(path))
     end
 
     def display_path(path)
-      home = Dir.home
+      home = home_dir
       path == home || path.start_with?(home + File::SEPARATOR) ? "~#{path[home.length..]}" : path
     end
 
     def run_quiet(cmd)
       stdout, _stderr, status = Open3.capture3(*cmd)
-      output = stdout.strip
-      status.success? && !output.empty? ? output : nil
+      status.success? ? utf8(stdout) : nil
     rescue Errno::ENOENT
       nil
     end
 
     def resolve_token(flag_token)
-      token = flag_token.to_s.strip
-      token = ENV.fetch('FIGMA_TOKEN', '').strip if token.empty?
-      token = run_quiet(['security', 'find-generic-password', '-s', KEYCHAIN_SERVICE, '-w']) if token.empty?
-      raise SyncError, NO_TOKEN unless token
-      raise SyncError, MALFORMED_TOKEN if token.match?(/[[:space:]]|[[:cntrl:]]/)
+      token = token_text(flag_token)
+      token = token_text(ENV.fetch('FIGMA_TOKEN', '')) if token.empty?
+      token = token_text(run_quiet(['security', 'find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'])) if token.empty?
+      raise SyncError, NO_TOKEN if token.empty?
+      raise SyncError, MALFORMED_TOKEN if !token.ascii_only? || token.match?(/[[:space:]]|[[:cntrl:]]/)
 
       token
+    end
+
+    def token_text(raw)
+      text = utf8(raw.to_s)
+      text.valid_encoding? ? text.strip : text
     end
 
     def parse_file_key(arg)
@@ -329,7 +348,7 @@ module FigmaSync
       path = File.join(out, MANIFEST_NAME)
       return nil unless File.exist?(path)
 
-      manifest = JSON.parse(File.read(path))
+      manifest = JSON.parse(File.read(path, encoding: Encoding::UTF_8))
       raise JSON::ParserError unless valid_manifest?(manifest)
 
       manifest
@@ -346,7 +365,7 @@ module FigmaSync
 
     def write_manifest(out, manifest)
       tmp = File.join(out, "#{MANIFEST_NAME}.tmp")
-      File.write(tmp, "#{JSON.pretty_generate(manifest)}\n")
+      File.write(tmp, "#{JSON.pretty_generate(manifest)}\n", encoding: Encoding::UTF_8)
       File.rename(tmp, File.join(out, MANIFEST_NAME))
     end
 
@@ -367,8 +386,10 @@ module FigmaSync
     end
 
     def contained_path(out, rel)
-      root = File.expand_path(out)
-      path = File.expand_path(rel, root)
+      return nil if rel.start_with?('~')
+
+      root = absolute_path(out)
+      path = absolute_path(rel, root)
       path.start_with?("#{root}/") ? path : nil
     end
 
@@ -379,9 +400,9 @@ module FigmaSync
     end
 
     def match_case(out, rel)
-      parent = File.expand_path(out)
+      parent = absolute_path(out)
       rel.split('/').each do |part|
-        actual = Dir.children(parent).find { _1 != part && _1.casecmp?(part) }
+        actual = Dir.children(parent, encoding: Encoding::UTF_8).find { _1 != part && _1.casecmp?(part) }
         if actual
           tmp = File.join(parent, ".figma-sync-case-#{Process.pid}")
           File.rename(File.join(parent, actual), tmp)
@@ -394,7 +415,7 @@ module FigmaSync
     end
 
     def remove_file(out, rel)
-      root = File.expand_path(out)
+      root = absolute_path(out)
       path = contained_path(root, rel)
       unless path
         log("warning: not deleting #{rel.inspect}; it is outside #{display_path(out)}")
@@ -476,7 +497,7 @@ module FigmaSync
       uri.query = URI.encode_www_form(params)
       response = request(uri, @headers)
       check_api(response, path)
-      JSON.parse(response.body)
+      JSON.parse(FigmaSync.utf8(response.body))
     rescue JSON::ParserError
       raise SyncError, "GET #{path} returned non-JSON output"
     end
@@ -541,7 +562,7 @@ module FigmaSync
     end
 
     def error_detail(response)
-      body = JSON.parse(response.body.to_s)
+      body = JSON.parse(FigmaSync.utf8(response.body.to_s))
       detail = body['err'] || body['message'] if body.is_a?(Hash)
       detail ? " (#{detail})" : ''
     rescue JSON::ParserError

@@ -18,6 +18,32 @@ RSpec.describe FigmaSync::Client do
       end
     end
 
+    context 'when the locale is US-ASCII and the body has non-ASCII characters' do
+      it 'parses the body as UTF-8' do
+        serve_http([200, { 'Content-Type' => 'application/json' }, '{"name":"Café 🟡"}'.b]) do |base, _requests|
+          stub_const('FigmaSync::Client::API_BASE', base)
+
+          file = with_default_external(Encoding::US_ASCII) { described_class.new('tok').get_file('SimKey', depth: 1) }
+
+          expect(file['name']).to eq('Café 🟡')
+          expect(file['name'].encoding).to eq(Encoding::UTF_8)
+        end
+      end
+    end
+
+    context 'when the locale is US-ASCII and an error body has non-ASCII characters' do
+      it 'includes the decoded error in the message' do
+        serve_http([404, {}, '{"err":"Fichier introuvable é"}'.b]) do |base, _requests|
+          stub_const('FigmaSync::Client::API_BASE', base)
+
+          with_default_external(Encoding::US_ASCII) do
+            expect { described_class.new('tok').get_file('SimKey', depth: 1) }
+              .to raise_error(FigmaSync::SyncError, 'GET /v1/files/SimKey returned HTTP 404 (Fichier introuvable é)')
+          end
+        end
+      end
+    end
+
     context 'when rate limited with Retry-After: 7' do
       it 'waits 7s and retries' do
         serve_http([429, { 'Retry-After' => '7' }, '{}'], [200, {}, '{"version":"v9"}']) do |base, _requests|

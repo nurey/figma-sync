@@ -52,7 +52,7 @@ module FigmaSyncHelpers
   def seed_manifest(out, nodes:, version: 'v1', file_key: 'SimKey', scale: 2.0, format: 'png')
     FileUtils.mkdir_p(out)
     manifest = { 'fileKey' => file_key, 'version' => version, 'scale' => scale, 'format' => format, 'nodes' => nodes }
-    File.write(File.join(out, '.figma-sync.json'), JSON.generate(manifest))
+    File.write(File.join(out, '.figma-sync.json'), JSON.generate(manifest), encoding: 'UTF-8')
   end
 
   def seed_file(out, rel, body = 'old image')
@@ -62,11 +62,31 @@ module FigmaSyncHelpers
   end
 
   def read_manifest(out)
-    JSON.parse(File.read(File.join(out, '.figma-sync.json')))
+    JSON.parse(File.read(File.join(out, '.figma-sync.json'), encoding: 'UTF-8'))
   end
 
   def files_under(out)
     Dir.glob('**/*', File::FNM_DOTMATCH, base: out).reject { |p| p.end_with?('.') || File.directory?(File.join(out, p)) }.sort
+  end
+
+  def with_default_external(encoding)
+    original = Encoding.default_external
+    silence_encoding_warning { Encoding.default_external = encoding }
+    yield
+  ensure
+    silence_encoding_warning { Encoding.default_external = original }
+  end
+
+  def silence_encoding_warning
+    verbose = $VERBOSE
+    $VERBOSE = nil
+    yield
+  ensure
+    $VERBOSE = verbose
+  end
+
+  def locale_tagged(string)
+    string.dup.force_encoding(Encoding::US_ASCII)
   end
 
   def case_insensitive?(dir)

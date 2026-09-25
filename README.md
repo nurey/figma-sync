@@ -89,7 +89,7 @@ The log file grows without limit. Clear it now and then with `: > ~/Library/Logs
 - **`HTTP 403`**: the token is invalid, expired, or lacks the `File content: read` scope. Store a new one with the keychain command above.
 - **`HTTP 429`**: Figma is rate limiting you. This is retried automatically, waiting for the time in `Retry-After` (up to 120s) when Figma sends it, otherwise 5s, 15s and 45s. Server errors and network errors are retried the same way.
 - **`No Figma token`**: none of `--token`, `FIGMA_TOKEN` or the keychain item gave a token. Under launchd, only the keychain item applies.
-- **`contains whitespace or control characters`**: the stored token has a stray newline or space in it. Store it again.
+- **`contains whitespace, control or non-ASCII characters`**: the stored token has a stray newline, space or other character in it. Store it again.
 - **Some frames failed**: they are listed at the end and the exit status is 1. The manifest's `version` is left unset, so the next run retries instead of reporting `Up to date`.
 
 ## Run the tests
