@@ -80,6 +80,26 @@ RSpec.describe FigmaSync do
       end
     end
 
+    context 'when the keychain returns non-ASCII bytes under a US-ASCII locale' do
+      it 'rejects the token instead of crashing' do
+        allow(ENV).to receive(:fetch).and_call_original
+        allow(ENV).to receive(:fetch).with('FIGMA_TOKEN', '').and_return('')
+        status = instance_double(Process::Status, success?: true)
+        allow(Open3).to receive(:capture3).and_return([locale_tagged("figd_\u00e9t\u00e9\n"), '', status])
+
+        expect { described_class.resolve_token(nil) }.to raise_error(FigmaSync::SyncError, FigmaSync::MALFORMED_TOKEN)
+      end
+    end
+
+    context 'when FIGMA_TOKEN holds non-ASCII bytes under a US-ASCII locale' do
+      it 'rejects the token instead of crashing' do
+        allow(ENV).to receive(:fetch).and_call_original
+        allow(ENV).to receive(:fetch).with('FIGMA_TOKEN', '').and_return(locale_tagged('figd_é'))
+
+        expect { described_class.resolve_token(nil) }.to raise_error(FigmaSync::SyncError, FigmaSync::MALFORMED_TOKEN)
+      end
+    end
+
     context 'when the keychain token contains inner whitespace' do
       it 'rejects it' do
         allow(ENV).to receive(:fetch).and_call_original

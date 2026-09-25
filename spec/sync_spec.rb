@@ -26,6 +26,46 @@ RSpec.describe FigmaSync do
       end
     end
 
+    context 'when the locale is US-ASCII and names contain emoji and accents' do
+      it 'loads, exports, saves and reloads the manifest as UTF-8' do
+        Dir.mktmpdir do |parent|
+          out = File.join(parent, 'Miroir é')
+          seed_manifest(out, nodes: { '1:1' => '🟡 Café/Accueil é__1-1.png', '9:9' => '🟡 Café/Gone ☕__9-9.png' })
+          seed_file(out, '🟡 Café/Accueil é__1-1.png')
+          seed_file(out, '🟡 Café/Gone ☕__9-9.png')
+          stub_figma(pages: [page('🟡 Café', frame('1:1', 'Accueil é'), frame('1:2', 'Menu ☕'))], version: 'v2')
+
+          with_default_external(Encoding::US_ASCII) do
+            result = run_cli('SimKey', '--token', 'tok', '--out', locale_tagged(out))
+            rerun = run_cli('SimKey', '--token', 'tok', '--out', locale_tagged(out))
+
+            expect(result.code).to eq(0)
+            expect(result.stderr).to include('[1/1] 🟡 Café: 2 frames', '(deleted 1 stale)')
+            expect(rerun.stdout).to eq("Up to date (version v2)\n")
+          end
+
+          expect(files_under(out)).to eq(['.figma-sync.json', '🟡 Café/Accueil é__1-1.png', '🟡 Café/Menu ☕__1-2.png'])
+          expect(read_manifest(out)['nodes']).to eq('1:1' => '🟡 Café/Accueil é__1-1.png', '1:2' => '🟡 Café/Menu ☕__1-2.png')
+        end
+      end
+    end
+
+    context 'when the locale is US-ASCII and only the case of an accented page changed' do
+      it 'still renames the page folder to the new case' do
+        Dir.mktmpdir do |out|
+          skip 'needs a case-insensitive volume for the system temp dir' unless case_insensitive?(out)
+          seed_manifest(out, nodes: { '1:2' => 'Café/Home__1-2.png' })
+          seed_file(out, 'Café/Home__1-2.png')
+          stub_figma(pages: [page('café', frame('1:2', 'Home'))])
+
+          result = with_default_external(Encoding::US_ASCII) { run_cli('SimKey', '--token', 'tok', '--out', out) }
+
+          expect(result.code).to eq(0)
+          expect(Dir.children(out, encoding: Encoding::UTF_8).sort).to eq(%w[.figma-sync.json café])
+        end
+      end
+    end
+
     context 'when the version, scale and format match the manifest' do
       it 'prints Up to date without fetching the full file' do
         Dir.mktmpdir do |out|
