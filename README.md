@@ -84,12 +84,6 @@ launchd jobs can't show a 1Password or biometric prompt, so create the keychain 
 
 The log file grows without limit. Clear it now and then with `: > ~/Library/Logs/figma-sync.log`.
 
-## Share via Google Drive
-
-In Drive for desktop, go to Preferences → My Mac → Add folder, and choose the output folder. Then share it from the Computers section on drive.google.com.
-
-Don't point `--out` directly at `~/Library/CloudStorage/...`: macOS TCC blocks processes started by launchd from writing there.
-
 ## Troubleshooting
 
 - **`HTTP 403`**: the token is invalid, expired, or lacks the `File content: read` scope. Store a new one with the keychain command above.
