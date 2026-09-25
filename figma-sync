@@ -1,0 +1,553 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'fileutils'
+require 'json'
+require 'net/http'
+require 'open3'
+require 'openssl'
+require 'optparse'
+require 'uri'
+
+module FigmaSync
+  BATCH_SIZE = 20
+  RETRY_DELAYS = [5, 15, 45].freeze
+  MAX_RETRY_AFTER = 120
+  MAX_NAME_BYTES = 100
+  FETCH_DEPTH = 4
+  MANIFEST_NAME = '.figma-sync.json'
+  KEYCHAIN_SERVICE = 'figma-token'
+  FORMATS = %w[png svg jpg pdf].freeze
+  SEPARATOR_PAGE = /\A[-[:space:]]*\z/
+  URL_KEY = %r{figma\.com/(?:design|file)/([A-Za-z0-9]+)}
+  NO_TOKEN = 'No Figma token. Set FIGMA_TOKEN, pass --token, or store one (security prompts for it): ' \
+             'security add-generic-password -s figma-token -a "$USER" -U -w'
+  MALFORMED_TOKEN = 'The Figma token contains whitespace or control characters; store it again without them'
+
+  class SyncError < StandardError; end
+  class AuthError < SyncError; end
+
+  class TransientError < SyncError
+    attr_reader :retry_after
+
+    def initialize(message, retry_after = nil)
+      super(message)
+      @retry_after = retry_after
+    end
+  end
+
+  class << self
+    def main(argv)
+      options = parse_options(argv)
+      sync(options)
+    rescue SyncError, SystemCallError => e
+      log("figma-sync: #{e.message}")
+      1
+    rescue Interrupt
+      log('figma-sync: interrupted')
+      130
+    end
+
+    def sync(options)
+      key = parse_file_key(options[:file])
+      client = Client.new(resolve_token(options[:token]))
+
+      meta = client.get_file(key, depth: 1)
+      out = options[:out] ? expand_user(options[:out]) : File.join(Dir.home, 'Figma', sanitize(meta['name']))
+      previous = File.exist?(out) ? load_manifest(out) : nil
+      if previous && previous['fileKey'] != key
+        raise SyncError, "#{display_path(out)} is synced from file #{previous['fileKey']}, not #{key}"
+      end
+
+      unchanged = previous &&
+                  previous['version'] == meta['version'] &&
+                  previous['format'] == options[:format] &&
+                  previous['scale'] == options[:scale]
+      if unchanged && !options[:force]
+        puts "Up to date (version #{meta['version']})"
+        return 0
+      end
+
+      log("Fetching #{meta['name']} (depth #{FETCH_DEPTH})...")
+      data = client.get_file(key, depth: FETCH_DEPTH)
+      pages = pages_with_frames(data['document'])
+      current_ids = pages.flat_map { |_, frames| frames.map { _1[:id] } }.to_set
+      previous_nodes = (previous || {}).fetch('nodes', {})
+      stale = previous_nodes.reject { |node_id, _| current_ids.include?(node_id) }.sort_by { |_, rel| rel }
+      batches = make_batches(pages, options[:format], options[:limit])
+
+      if options[:dry_run]
+        renamed = batches.sum do |_, items|
+          items.count { |node_id, rel| previous_nodes.key?(node_id) && previous_nodes[node_id] != rel }
+        end
+        puts "Output: #{display_path(out)}"
+        print_plan(pages, batches, options[:format], stale.map(&:last), renamed)
+        return 0
+      end
+
+      FileUtils.mkdir_p(out)
+      nodes = previous_nodes.dup
+      failed = []
+      skipped = []
+      unrenderable = []
+      exported_count = 0
+      removed = 0
+      complete = false
+      manifest = {
+        'fileKey' => key,
+        'version' => nil,
+        'lastModified' => data['lastModified'],
+        'syncedAt' => nil,
+        'scale' => options[:scale],
+        'format' => options[:format],
+        'nodes' => nodes
+      }
+      begin
+        batches.each.with_index(1) do |(page_name, items), index|
+          log("[#{index}/#{batches.size}] #{page_name.strip}: #{items.size} frames")
+          result = export_batch(client, key, items, options[:format], options[:scale], out)
+          result => { exported:, failed: batch_failed, skipped: batch_skipped, error: }
+          exported.each do |node_id, rel|
+            old = nodes[node_id]
+            if old && old != rel
+              if same_file?(out, old, rel)
+                match_case(out, rel)
+              elsif remove_file(out, old) == :removed
+                removed += 1
+              end
+            end
+            nodes[node_id] = rel
+          end
+          exported_count += exported.size
+          skipped.concat(batch_skipped)
+          batch_skipped.each do |node_id|
+            next unless nodes.key?(node_id)
+
+            unrenderable << nodes[node_id] if remove_file(out, nodes[node_id]) == :removed
+            nodes.delete(node_id)
+          end
+          next if batch_failed.empty?
+
+          log("    failed after retries: #{batch_failed.join(', ')} (#{error})")
+          failed.concat(batch_failed)
+        end
+        stale.each do |node_id, rel|
+          removed += 1 if remove_file(out, rel) == :removed
+          nodes.delete(node_id)
+        end
+        complete = true
+      ensure
+        manifest['syncedAt'] = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%S+00:00')
+        manifest['version'] = meta['version'] if complete && failed.empty? && options[:limit].nil?
+        write_manifest(out, manifest)
+      end
+
+      log("Exported #{exported_count} frames to #{display_path(out)} (deleted #{removed} stale)")
+      log("#{skipped.size} frame(s) rendered nothing and were skipped: #{skipped.join(', ')}") if skipped.any?
+      unrenderable.each { log("    removed #{_1}") }
+      unless failed.empty?
+        log("#{failed.size} frame(s) failed: #{failed.join(', ')}")
+        return 1
+      end
+      0
+    end
+
+    def export_batch(client, key, batch, fmt, scale, out)
+      targets = batch.to_h
+      begin
+        urls = with_retries("#{targets.size} frame(s)") { client.image_urls(key, targets.keys, fmt:, scale:) }
+      rescue AuthError
+        raise
+      rescue SyncError => e
+        return { exported: {}, failed: targets.keys, skipped: [], error: e.message }
+      end
+
+      exported = {}
+      failed = []
+      skipped = []
+      error = nil
+      targets.each do |node_id, rel|
+        url = urls[node_id]
+        unless url
+          skipped << node_id
+          next
+        end
+
+        client.download(url, File.join(out, rel))
+        exported[node_id] = rel
+      rescue SyncError => e
+        failed << node_id
+        error = e.message
+      end
+      { exported:, failed:, skipped:, error: }
+    end
+
+    def with_retries(label)
+      attempt = 0
+      begin
+        yield
+      rescue TransientError => e
+        raise if attempt == RETRY_DELAYS.size
+
+        delay = e.retry_after || RETRY_DELAYS[attempt]
+        attempt += 1
+        log("    retrying #{label} in #{delay}s (#{e.message})")
+        sleep(delay)
+        retry
+      end
+    end
+
+    def parse_options(argv)
+      options = { scale: 2.0, format: 'png', force: false, dry_run: false, limit: nil, out: nil, token: nil }
+      usage = nil
+      parser = OptionParser.new do |o|
+        o.program_name = 'figma-sync'
+        o.banner = 'usage: figma-sync [options] FILE'
+        o.separator('')
+        o.separator('Mirror every frame of a Figma file to a local folder, keeping it in sync on re-runs.')
+        o.separator('')
+        o.separator('FILE is a Figma file key or URL (https://www.figma.com/design/<key>/...)')
+        o.separator('')
+        o.on('--out DIR', 'output directory (default: ~/Figma/<file name>/)') { options[:out] = _1 }
+        o.on('--scale N', Float, 'export scale, 0.01-4 (default: 2)') do |scale|
+          raise OptionParser::InvalidArgument, "#{scale} (must be between 0.01 and 4)" unless scale.between?(0.01, 4)
+
+          options[:scale] = scale
+        end
+        o.on('--format FORMAT', FORMATS, "image format: #{FORMATS.join(', ')} (default: png)") { options[:format] = _1 }
+        o.on('--force', 'export even if the file version is unchanged') { options[:force] = true }
+        o.on('--dry-run', 'show what would be exported/deleted; write nothing') { options[:dry_run] = true }
+        o.on('--token TOKEN', 'Figma personal access token (default: $FIGMA_TOKEN, then the keychain)') do |token|
+          options[:token] = token
+        end
+        o.on('-h', '--help', 'show this help and exit') do
+          puts usage
+          exit 0
+        end
+      end
+      usage = parser.help
+      parser.on('--limit N', Integer) do |limit|
+        raise OptionParser::InvalidArgument, "#{limit} (must be >= 1)" if limit < 1
+
+        options[:limit] = limit
+      end
+
+      begin
+        rest = parser.parse(argv)
+        raise OptionParser::MissingArgument, 'FILE' if rest.empty?
+        raise OptionParser::NeedlessArgument, rest.drop(1).join(' ') if rest.size > 1
+      rescue OptionParser::ParseError => e
+        warn(usage)
+        warn("figma-sync: #{e.message}")
+        exit 2
+      end
+      options.merge(file: rest.first)
+    end
+
+    def log(msg)
+      warn(msg)
+    end
+
+    def expand_user(path)
+      path.start_with?('~') ? File.expand_path(path) : path
+    end
+
+    def display_path(path)
+      home = Dir.home
+      path == home || path.start_with?(home + File::SEPARATOR) ? "~#{path[home.length..]}" : path
+    end
+
+    def run_quiet(cmd)
+      stdout, _stderr, status = Open3.capture3(*cmd)
+      output = stdout.strip
+      status.success? && !output.empty? ? output : nil
+    rescue Errno::ENOENT
+      nil
+    end
+
+    def resolve_token(flag_token)
+      token = flag_token.to_s.strip
+      token = ENV.fetch('FIGMA_TOKEN', '').strip if token.empty?
+      token = run_quiet(['security', 'find-generic-password', '-s', KEYCHAIN_SERVICE, '-w']) if token.empty?
+      raise SyncError, NO_TOKEN unless token
+      raise SyncError, MALFORMED_TOKEN if token.match?(/[[:space:]]|[[:cntrl:]]/)
+
+      token
+    end
+
+    def parse_file_key(arg)
+      match = URL_KEY.match(arg)
+      return match[1] if match
+      return arg if arg.match?(/\A[A-Za-z0-9]+\z/)
+
+      raise SyncError, "cannot parse a Figma file key from #{arg.inspect}"
+    end
+
+    def sanitize(name, fallback = 'untitled')
+      cleaned = name.tr('/:', '--').gsub(/[[:space:]]+/, ' ').sub(/\A[.[:space:]]+/, '').strip
+      cleaned = cleaned.byteslice(0, MAX_NAME_BYTES).scrub('').strip if cleaned.bytesize > MAX_NAME_BYTES
+      cleaned.empty? ? fallback : cleaned
+    end
+
+    def hidden?(node)
+      node['visible'] == false || node['opacity']&.zero?
+    end
+
+    def collect_frames(node, page_name, frames)
+      node.fetch('children', []).each do |child|
+        next if hidden?(child)
+
+        case child['type']
+        when 'FRAME'
+          frames << { id: child['id'], name: child['name'], page: page_name }
+        when 'SECTION'
+          unless child.key?('children')
+            log("warning: section #{child['name'].inspect} on #{page_name.inspect} is nested deeper than the " \
+                "#{FETCH_DEPTH} levels fetched; its frames are not exported")
+          end
+          collect_frames(child, page_name, frames)
+        end
+      end
+    end
+
+    def pages_with_frames(document)
+      document.fetch('children', []).filter_map do |page|
+        next if page['type'] != 'CANVAS' || SEPARATOR_PAGE.match?(page['name'])
+
+        frames = []
+        collect_frames(page, page['name'], frames)
+        [page['name'], frames]
+      end
+    end
+
+    def relative_path(frame, fmt)
+      node_suffix = frame[:id].tr(':', '-')
+      "#{sanitize(frame[:page])}/#{sanitize(frame[:name])}__#{node_suffix}.#{fmt}"
+    end
+
+    def load_manifest(out)
+      path = File.join(out, MANIFEST_NAME)
+      return nil unless File.exist?(path)
+
+      manifest = JSON.parse(File.read(path))
+      raise JSON::ParserError unless valid_manifest?(manifest)
+
+      manifest
+    rescue JSON::ParserError
+      raise SyncError, "#{display_path(path)} is not a valid figma-sync manifest; fix or delete it"
+    end
+
+    def valid_manifest?(manifest)
+      return false unless manifest.is_a?(Hash)
+
+      nodes = manifest.fetch('nodes', {})
+      nodes.is_a?(Hash) && nodes.values.all?(String)
+    end
+
+    def write_manifest(out, manifest)
+      tmp = File.join(out, "#{MANIFEST_NAME}.tmp")
+      File.write(tmp, "#{JSON.pretty_generate(manifest)}\n")
+      File.rename(tmp, File.join(out, MANIFEST_NAME))
+    end
+
+    def make_batches(pages, fmt, limit)
+      batches = []
+      remaining = limit
+      pages.each do |page_name, frames|
+        unless remaining.nil?
+          frames = frames.first(remaining)
+          remaining -= frames.size
+        end
+        frames.each_slice(BATCH_SIZE) do |chunk|
+          batches << [page_name, chunk.map { [_1[:id], relative_path(_1, fmt)] }]
+        end
+        break if remaining&.zero?
+      end
+      batches
+    end
+
+    def contained_path(out, rel)
+      root = File.expand_path(out)
+      path = File.expand_path(rel, root)
+      path.start_with?("#{root}/") ? path : nil
+    end
+
+    def same_file?(out, rel_a, rel_b)
+      path_a = contained_path(out, rel_a)
+      path_b = contained_path(out, rel_b)
+      !path_a.nil? && !path_b.nil? && File.identical?(path_a, path_b)
+    end
+
+    def match_case(out, rel)
+      parent = File.expand_path(out)
+      rel.split('/').each do |part|
+        actual = Dir.children(parent).find { _1 != part && _1.casecmp?(part) }
+        if actual
+          tmp = File.join(parent, ".figma-sync-case-#{Process.pid}")
+          File.rename(File.join(parent, actual), tmp)
+          File.rename(tmp, File.join(parent, part))
+        end
+        parent = File.join(parent, part)
+      end
+    rescue SystemCallError => e
+      log("warning: could not update the capitalisation of #{rel.inspect}: #{e.message}")
+    end
+
+    def remove_file(out, rel)
+      root = File.expand_path(out)
+      path = contained_path(root, rel)
+      unless path
+        log("warning: not deleting #{rel.inspect}; it is outside #{display_path(out)}")
+        return :unsafe
+      end
+      return :absent unless File.file?(path)
+
+      File.unlink(path)
+      parent = File.dirname(path)
+      while parent.start_with?("#{root}/") && Dir.empty?(parent)
+        Dir.rmdir(parent)
+        parent = File.dirname(parent)
+      end
+      :removed
+    end
+
+    def print_plan(pages, batches, fmt, stale, renamed_count)
+      planned = batches.flat_map { |_, items| items.map(&:first) }.to_set
+      pages.each do |page_name, frames|
+        next if frames.empty?
+
+        puts "#{page_name.strip} (#{frames.size} frames)"
+        frames.each do |frame|
+          marker = planned.include?(frame[:id]) ? '' : '  (skipped: --limit)'
+          puts "  #{frame[:name]}  ->  #{relative_path(frame, fmt)}#{marker}"
+        end
+      end
+      total = pages.sum { |_, frames| frames.size }
+      puts
+      puts "#{pages.count { |_, frames| frames.any? }} pages with frames, #{total} frames"
+      puts "Would export #{planned.size} frames in #{batches.size} batches"
+      puts "Would delete #{stale.size} stale file(s) for removed frames" +
+           (renamed_count.positive? ? ", plus up to #{renamed_count} superseded by renamed paths" : '')
+      stale.each { puts "  - #{_1}" }
+    end
+  end
+
+  class Client
+    API_BASE = 'https://api.figma.com'
+    OPEN_TIMEOUT = 30
+    READ_TIMEOUT = 120
+    MAX_REDIRECTS = 5
+    NETWORK_ERRORS = [SocketError, Timeout::Error, EOFError, IOError, SystemCallError, OpenSSL::SSL::SSLError].freeze
+
+    def initialize(token)
+      @headers = { 'X-Figma-Token' => token }
+    end
+
+    def get_file(key, depth:)
+      FigmaSync.with_retries("file #{key}") { api_get("/v1/files/#{key}", depth:) }
+    end
+
+    def image_urls(key, ids, fmt:, scale:)
+      body = api_get("/v1/images/#{key}", ids: ids.join(','), format: fmt, scale: format('%g', scale))
+      raise SyncError, "images request failed: #{body['err']}" if body['err']
+
+      body['images'] || {}
+    end
+
+    def download(url, dest)
+      tmp = File.join(File.dirname(dest), ".#{File.basename(dest)}.part")
+      local_io { FileUtils.mkdir_p(File.dirname(dest)) }
+      FigmaSync.with_retries("download #{File.basename(dest)}") { fetch_to(URI(url), tmp) }
+      local_io { File.rename(tmp, dest) }
+    ensure
+      FileUtils.rm_f(tmp)
+    end
+
+    private
+
+    def local_io
+      yield
+    rescue SystemCallError => e
+      raise SyncError, e.message
+    end
+
+    def api_get(path, **params)
+      uri = URI("#{API_BASE}#{path}")
+      uri.query = URI.encode_www_form(params)
+      response = request(uri, @headers)
+      check_api(response, path)
+      JSON.parse(response.body)
+    rescue JSON::ParserError
+      raise SyncError, "GET #{path} returned non-JSON output"
+    end
+
+    def check_api(response, path)
+      return if response.is_a?(Net::HTTPSuccess)
+
+      detail = error_detail(response)
+      if response.code == '403'
+        raise AuthError, "Figma API returned HTTP 403#{detail}: the token is invalid or lacks access to this file"
+      end
+
+      raise status_error(response, "GET #{path}", detail)
+    end
+
+    def fetch_to(uri, path, redirects = MAX_REDIRECTS)
+      location = nil
+      request(uri) do |response|
+        case response
+        when Net::HTTPSuccess then write_body(response, path)
+        when Net::HTTPRedirection then location = response['location']
+        else raise status_error(response, "download from #{uri.host}")
+        end
+      end
+      return unless location
+      raise SyncError, "too many redirects downloading from #{uri.host}" if redirects.zero?
+
+      fetch_to(URI.join(uri.to_s, location), path, redirects - 1)
+    end
+
+    def write_body(response, path)
+      file = local_io { File.open(path, 'wb') }
+      begin
+        response.read_body { |chunk| local_io { file.write(chunk) } }
+      ensure
+        local_io { file.close }
+      end
+    end
+
+    def request(uri, headers = {}, &)
+      Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https',
+                                          open_timeout: OPEN_TIMEOUT, read_timeout: READ_TIMEOUT) do |http|
+        http.request(Net::HTTP::Get.new(uri, headers), &)
+      end
+    rescue *NETWORK_ERRORS => e
+      raise TransientError, "#{uri.host}: #{e.message} (#{e.class})"
+    end
+
+    def status_error(response, label, detail = '')
+      message = "#{label} returned HTTP #{response.code}#{detail}"
+      code = response.code.to_i
+      return TransientError.new(message, retry_after(response)) if code == 429
+      return TransientError.new(message) if code >= 500
+
+      SyncError.new(message)
+    end
+
+    def retry_after(response)
+      value = response['retry-after']
+      seconds = value&.match?(/\A\d+\z/) ? value.to_i : 0
+      seconds.positive? ? [seconds, FigmaSync::MAX_RETRY_AFTER].min : nil
+    end
+
+    def error_detail(response)
+      body = JSON.parse(response.body.to_s)
+      detail = body['err'] || body['message'] if body.is_a?(Hash)
+      detail ? " (#{detail})" : ''
+    rescue JSON::ParserError
+      ''
+    end
+  end
+end
+
+exit(FigmaSync.main(ARGV)) if $PROGRAM_NAME == __FILE__
