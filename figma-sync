@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+require 'digest'
 require 'fileutils'
 require 'json'
 require 'net/http'
@@ -16,6 +17,9 @@ module FigmaSync
   MAX_NAME_BYTES = 100
   FETCH_DEPTH = 4
   MANIFEST_NAME = '.figma-sync.json'
+  MANIFEST_VERSION = 2
+  SPLITTABLE_STATUSES = [400, 413, 500, 502, 503, 504].freeze
+  MAX_HASH_FAILURES = 3
   KEYCHAIN_SERVICE = 'figma-token'
   FORMATS = %w[png svg jpg pdf].freeze
   SEPARATOR_PAGE = /\A[-[:space:]]*\z/
@@ -24,14 +28,22 @@ module FigmaSync
              'security add-generic-password -s figma-token -a "$USER" -U -w'
   MALFORMED_TOKEN = 'The Figma token contains whitespace, control or non-ASCII characters; store it again without them'
 
-  class SyncError < StandardError; end
+  class SyncError < StandardError
+    attr_reader :status
+
+    def initialize(message = nil, status: nil)
+      super(message)
+      @status = status
+    end
+  end
+
   class AuthError < SyncError; end
 
   class TransientError < SyncError
     attr_reader :retry_after
 
-    def initialize(message, retry_after = nil)
-      super(message)
+    def initialize(message, retry_after = nil, status: nil)
+      super(message, status:)
       @retry_after = retry_after
     end
   end
@@ -46,6 +58,8 @@ module FigmaSync
     rescue Interrupt
       log('figma-sync: interrupted')
       130
+    ensure
+      Client.close_sessions
     end
 
     def sync(options)
@@ -72,19 +86,25 @@ module FigmaSync
       data = client.get_file(key, depth: FETCH_DEPTH)
       pages = pages_with_frames(data['document'])
       current_ids = pages.flat_map { |_, frames| frames.map { _1[:id] } }.to_set
-      previous_nodes = (previous || {}).fetch('nodes', {})
-      stale = previous_nodes.reject { |node_id, _| current_ids.include?(node_id) }.sort_by { |_, rel| rel }
-      batches = make_batches(pages, options[:format], options[:limit])
+      previous_nodes = manifest_entries((previous || {}).fetch('nodes', {}))
+      stale = previous_nodes.reject { |node_id, _| current_ids.include?(node_id) }.sort_by { |_, entry| entry['path'] }
+      considered = limit_frames(pages, options[:limit])
+      hashes = hash_frames(client, key, considered.flat_map(&:last))
+      rerender = if options[:force] then '--force'
+                 elsif previous && (previous['scale'] != options[:scale] || previous['format'] != options[:format])
+                   'scale or format changed'
+                 end
+      plan = plan_frames(considered, previous_nodes, hashes, out, options[:format], rerender)
+      batches = make_batches(plan[:export_pages], options[:format])
+      summary = plan_summary(plan, rerender)
 
       if options[:dry_run]
-        renamed = batches.sum do |_, items|
-          items.count { |node_id, rel| previous_nodes.key?(node_id) && previous_nodes[node_id] != rel }
-        end
         puts "Output: #{display_path(out)}"
-        print_plan(pages, batches, options[:format], stale.map(&:last), renamed)
+        print_plan(plan, batches, summary, stale.map { |_, entry| entry['path'] })
         return 0
       end
 
+      log(summary)
       FileUtils.mkdir_p(out)
       nodes = previous_nodes.dup
       failed = []
@@ -95,6 +115,7 @@ module FigmaSync
       complete = false
       manifest = {
         'fileKey' => key,
+        'manifestVersion' => MANIFEST_VERSION,
         'version' => nil,
         'lastModified' => data['lastModified'],
         'syncedAt' => nil,
@@ -103,12 +124,16 @@ module FigmaSync
         'nodes' => nodes
       }
       begin
+        plan[:carry].each do |frame|
+          move_file(out, frame[:old], frame[:rel]) if frame[:old] != frame[:rel]
+          nodes[frame[:id]] = { 'path' => frame[:rel], 'hash' => frame[:hash] }
+        end
         batches.each.with_index(1) do |(page_name, items), index|
           log("[#{index}/#{batches.size}] #{page_name.strip}: #{items.size} frames")
           result = export_batch(client, key, items, options[:format], options[:scale], out)
           result => { exported:, failed: batch_failed, skipped: batch_skipped, error: }
           exported.each do |node_id, rel|
-            old = nodes[node_id]
+            old = nodes.dig(node_id, 'path')
             if old && old != rel
               if same_file?(out, old, rel)
                 match_case(out, rel)
@@ -116,14 +141,14 @@ module FigmaSync
                 removed += 1
               end
             end
-            nodes[node_id] = rel
+            nodes[node_id] = { 'path' => rel, 'hash' => hashes[node_id] }
           end
           exported_count += exported.size
           skipped.concat(batch_skipped)
           batch_skipped.each do |node_id|
             next unless nodes.key?(node_id)
 
-            unrenderable << nodes[node_id] if remove_file(out, nodes[node_id]) == :removed
+            unrenderable << nodes[node_id]['path'] if remove_file(out, nodes[node_id]['path']) == :removed
             nodes.delete(node_id)
           end
           next if batch_failed.empty?
@@ -131,8 +156,8 @@ module FigmaSync
           log("    failed after retries: #{batch_failed.join(', ')} (#{error})")
           failed.concat(batch_failed)
         end
-        stale.each do |node_id, rel|
-          removed += 1 if remove_file(out, rel) == :removed
+        stale.each do |node_id, entry|
+          removed += 1 if remove_file(out, entry['path']) == :removed
           nodes.delete(node_id)
         end
         complete = true
@@ -182,12 +207,12 @@ module FigmaSync
       { exported:, failed:, skipped:, error: }
     end
 
-    def with_retries(label)
+    def with_retries(label, retry_if: nil)
       attempt = 0
       begin
         yield
       rescue TransientError => e
-        raise if attempt == RETRY_DELAYS.size
+        raise if attempt == RETRY_DELAYS.size || (retry_if && !retry_if.call(e))
 
         delay = e.retry_after || RETRY_DELAYS[attempt]
         attempt += 1
@@ -350,6 +375,10 @@ module FigmaSync
 
       manifest = JSON.parse(File.read(path, encoding: Encoding::UTF_8))
       raise JSON::ParserError unless valid_manifest?(manifest)
+      if manifest.fetch('manifestVersion', 1) > MANIFEST_VERSION
+        raise SyncError, "#{display_path(path)} was written by a newer figma-sync (manifestVersion " \
+                         "#{manifest['manifestVersion']}); upgrade this copy of the script"
+      end
 
       manifest
     rescue JSON::ParserError
@@ -358,9 +387,20 @@ module FigmaSync
 
     def valid_manifest?(manifest)
       return false unless manifest.is_a?(Hash)
+      return false unless manifest.fetch('manifestVersion', 1).is_a?(Integer)
 
       nodes = manifest.fetch('nodes', {})
-      nodes.is_a?(Hash) && nodes.values.all?(String)
+      nodes.is_a?(Hash) && nodes.values.all? { valid_entry?(_1) }
+    end
+
+    def valid_entry?(entry)
+      return true if entry.is_a?(String)
+
+      entry.is_a?(Hash) && entry['path'].is_a?(String) && (entry['hash'].nil? || entry['hash'].is_a?(String))
+    end
+
+    def manifest_entries(nodes)
+      nodes.transform_values { _1.is_a?(String) ? { 'path' => _1, 'hash' => nil } : _1.slice('path', 'hash') }
     end
 
     def write_manifest(out, manifest)
@@ -369,20 +409,120 @@ module FigmaSync
       File.rename(tmp, File.join(out, MANIFEST_NAME))
     end
 
-    def make_batches(pages, fmt, limit)
-      batches = []
-      remaining = limit
-      pages.each do |page_name, frames|
-        unless remaining.nil?
-          frames = frames.first(remaining)
-          remaining -= frames.size
-        end
-        frames.each_slice(BATCH_SIZE) do |chunk|
-          batches << [page_name, chunk.map { [_1[:id], relative_path(_1, fmt)] }]
-        end
-        break if remaining&.zero?
+    def make_batches(pages, fmt)
+      pages.flat_map do |page_name, frames|
+        frames.each_slice(BATCH_SIZE).map { |chunk| [page_name, chunk.map { [_1[:id], relative_path(_1, fmt)] }] }
       end
-      batches
+    end
+
+    def limit_frames(pages, limit)
+      return pages if limit.nil?
+
+      remaining = limit
+      pages.filter_map do |page_name, frames|
+        next if remaining.zero?
+
+        taken = frames.first(remaining)
+        remaining -= taken.size
+        [page_name, taken]
+      end
+    end
+
+    def hash_frames(client, key, frames)
+      chunks = frames.map { _1[:id] }.each_slice(BATCH_SIZE).to_a
+      log("Hashing #{frames.size} frames in #{chunks.size} requests...") if chunks.any?
+      state = { failures: 0, skipped: 0 }
+      hashes = chunks.each.with_index(1).with_object({}) do |(ids, index), result|
+        skipped_before = state[:skipped]
+        chunk = chunk_hashes(client, key, ids, state)
+        result.merge!(chunk)
+        next if state[:skipped] - skipped_before == ids.size
+
+        hashed = ids.count { chunk[_1] }
+        log("  [#{index}/#{chunks.size}] hashed #{hashed == ids.size ? hashed : "#{hashed} of #{ids.size}"} frames")
+      end
+      if state[:skipped].positive?
+        log("warning: stopped hashing after #{MAX_HASH_FAILURES} failed requests; " \
+            "#{state[:skipped]} remaining frame(s) will be exported without a hash")
+      end
+      hashes
+    end
+
+    # A frame that cannot be hashed gets a nil hash, which counts as changed, so a request Figma
+    # keeps refusing costs an export instead of stopping the sync. Only rate limiting stops the
+    # run: exporting instead would spend image requests while Figma is already refusing calls.
+    # A multi-frame request that fails is split at once rather than retried, and the backoff
+    # retries are spent only on single frames; after MAX_HASH_FAILURES fallbacks the remaining
+    # frames are not requested at all, so a /nodes outage costs minutes, not hours.
+    def chunk_hashes(client, key, ids, state)
+      if state[:failures] >= MAX_HASH_FAILURES
+        state[:skipped] += ids.size
+        return ids.to_h { [_1, nil] }
+      end
+
+      retry_if = ids.size > 1 ? ->(e) { e.status == 429 } : nil
+      documents = with_retries("#{ids.size} node(s)", retry_if:) { client.node_documents(key, ids) }
+      documents.transform_values { content_hash(_1) }
+    rescue AuthError
+      raise
+    rescue SyncError => e
+      if e.status == 429
+        raise SyncError, "Figma is rate limiting frame hashing (#{e.message}); stopped without changing anything, " \
+                         'the next run will retry'
+      end
+      if ids.size > 1 && splittable?(e)
+        half = ids.size.fdiv(2).ceil
+        return chunk_hashes(client, key, ids.first(half), state).merge(chunk_hashes(client, key, ids.drop(half), state))
+      end
+
+      state[:failures] += 1
+      log("warning: could not hash #{ids.join(', ')} (#{e.message}); exporting them without a hash")
+      ids.to_h { [_1, nil] }
+    end
+
+    def splittable?(error)
+      SPLITTABLE_STATUSES.include?(error.status) || error.cause.is_a?(Net::ReadTimeout)
+    end
+
+    # The root's name is excluded so that renaming a frame moves its file instead of re-rendering it.
+    def content_hash(document)
+      document && Digest::SHA256.hexdigest(JSON.generate(canonical(document.except('name')), max_nesting: false))
+    end
+
+    def canonical(value)
+      case value
+      when Hash then value.keys.sort.to_h { |k| [k, canonical(value[k])] }
+      when Array then value.map { canonical(_1) }
+      else value
+      end
+    end
+
+    def plan_frames(pages, entries, hashes, out, fmt, rerender)
+      plan = { new: [], changed: [], unchanged: [] }
+      export_pages = pages.map do |page_name, frames|
+        exporting = frames.select do |frame|
+          entry = entries[frame[:id]]
+          item = frame.merge(rel: relative_path(frame, fmt), hash: hashes[frame[:id]], old: entry&.fetch('path'))
+          status = frame_status(entry, item[:hash], out)
+          plan[status] << item
+          rerender || status != :unchanged
+        end
+        [page_name, exporting]
+      end
+      plan.merge(export_pages:, carry: rerender ? [] : plan[:unchanged])
+    end
+
+    def frame_status(entry, hash, out)
+      return :new if entry.nil?
+      return :changed if hash.nil? || entry['hash'] != hash || !file_present?(out, entry['path'])
+
+      :unchanged
+    end
+
+    def plan_summary(plan, rerender)
+      counts = %i[changed new unchanged].map { "#{plan[_1].size} #{_1}" }.join(', ')
+      total = plan.values_at(:new, :changed, :unchanged).sum(&:size)
+      "#{total} frames: #{counts}#{"; re-exporting all (#{rerender})" if rerender}"
     end
 
     def contained_path(out, rel)
@@ -424,31 +564,44 @@ module FigmaSync
       return :absent unless File.file?(path)
 
       File.unlink(path)
-      parent = File.dirname(path)
+      prune_empty_dirs(root, File.dirname(path))
+      :removed
+    end
+
+    def move_file(out, old_rel, new_rel)
+      return match_case(out, new_rel) if same_file?(out, old_rel, new_rel)
+
+      from = contained_path(out, old_rel)
+      to = contained_path(out, new_rel)
+      FileUtils.mkdir_p(File.dirname(to))
+      File.rename(from, to)
+      prune_empty_dirs(absolute_path(out), File.dirname(from))
+    end
+
+    def prune_empty_dirs(root, parent)
       while parent.start_with?("#{root}/") && Dir.empty?(parent)
         Dir.rmdir(parent)
         parent = File.dirname(parent)
       end
-      :removed
     end
 
-    def print_plan(pages, batches, fmt, stale, renamed_count)
-      planned = batches.flat_map { |_, items| items.map(&:first) }.to_set
-      pages.each do |page_name, frames|
-        next if frames.empty?
+    def file_present?(out, rel)
+      path = contained_path(out, rel)
+      !path.nil? && File.file?(path)
+    end
 
-        puts "#{page_name.strip} (#{frames.size} frames)"
-        frames.each do |frame|
-          marker = planned.include?(frame[:id]) ? '' : '  (skipped: --limit)'
-          puts "  #{frame[:name]}  ->  #{relative_path(frame, fmt)}#{marker}"
-        end
-      end
-      total = pages.sum { |_, frames| frames.size }
-      puts
-      puts "#{pages.count { |_, frames| frames.any? }} pages with frames, #{total} frames"
-      puts "Would export #{planned.size} frames in #{batches.size} batches"
+    def print_plan(plan, batches, summary, stale)
+      items = %i[new changed unchanged].flat_map { |status| plan[status].map { [_1[:id], _1.merge(status:)] } }.to_h
+      exporting = batches.flat_map { |_, batch| batch.map { items.fetch(_1.first) } }
+      renames = plan[:carry].reject { _1[:old] == _1[:rel] }
+      superseded = exporting.count { _1[:old] && _1[:old] != _1[:rel] }
+      puts summary
+      puts "Would export #{exporting.size} frames in #{batches.size} batches"
+      exporting.each { puts "  #{_1[:rel]}  (#{_1[:status]})" }
+      puts "Would rename #{renames.size} unchanged file(s)" if renames.any?
+      renames.each { puts "  - #{_1[:old]}  ->  #{_1[:rel]}" }
       puts "Would delete #{stale.size} stale file(s) for removed frames" +
-           (renamed_count.positive? ? ", plus up to #{renamed_count} superseded by renamed paths" : '')
+           (superseded.positive? ? ", plus up to #{superseded} superseded by renamed paths" : '')
       stale.each { puts "  - #{_1}" }
     end
   end
@@ -458,7 +611,17 @@ module FigmaSync
     OPEN_TIMEOUT = 30
     READ_TIMEOUT = 120
     MAX_REDIRECTS = 5
+    KEEP_ALIVE_TIMEOUT = 30
     NETWORK_ERRORS = [SocketError, Timeout::Error, EOFError, IOError, SystemCallError, OpenSSL::SSL::SSLError].freeze
+
+    def self.sessions
+      @sessions ||= {}
+    end
+
+    def self.close_sessions
+      sessions.each_value { |http| http.finish if http.started? }
+      sessions.clear
+    end
 
     def initialize(token)
       @headers = { 'X-Figma-Token' => token }
@@ -466,6 +629,11 @@ module FigmaSync
 
     def get_file(key, depth:)
       FigmaSync.with_retries("file #{key}") { api_get("/v1/files/#{key}", depth:) }
+    end
+
+    def node_documents(key, ids)
+      body = api_get("/v1/files/#{key}/nodes", ids: ids.join(','), geometry: 'paths')
+      (body['nodes'] || {}).transform_values { _1&.fetch('document', nil) }
     end
 
     def image_urls(key, ids, fmt:, scale:)
@@ -497,7 +665,7 @@ module FigmaSync
       uri.query = URI.encode_www_form(params)
       response = request(uri, @headers)
       check_api(response, path)
-      JSON.parse(FigmaSync.utf8(response.body))
+      JSON.parse(FigmaSync.utf8(response.body), max_nesting: false)
     rescue JSON::ParserError
       raise SyncError, "GET #{path} returned non-JSON output"
     end
@@ -538,21 +706,24 @@ module FigmaSync
     end
 
     def request(uri, headers = {}, &)
-      Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https',
-                                          open_timeout: OPEN_TIMEOUT, read_timeout: READ_TIMEOUT) do |http|
-        http.request(Net::HTTP::Get.new(uri, headers), &)
-      end
+      session(uri).request(Net::HTTP::Get.new(uri, headers), &)
     rescue *NETWORK_ERRORS => e
       raise TransientError, "#{uri.host}: #{e.message} (#{e.class})"
+    end
+
+    def session(uri)
+      self.class.sessions[[uri.scheme, uri.host, uri.port]] ||=
+        Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https', open_timeout: OPEN_TIMEOUT,
+                                            read_timeout: READ_TIMEOUT, keep_alive_timeout: KEEP_ALIVE_TIMEOUT)
     end
 
     def status_error(response, label, detail = '')
       message = "#{label} returned HTTP #{response.code}#{detail}"
       code = response.code.to_i
-      return TransientError.new(message, retry_after(response)) if code == 429
-      return TransientError.new(message) if code >= 500
+      return TransientError.new(message, retry_after(response), status: code) if code == 429
+      return TransientError.new(message, status: code) if code >= 500
 
-      SyncError.new(message)
+      SyncError.new(message, status: code)
     end
 
     def retry_after(response)

@@ -96,22 +96,30 @@ RSpec.describe FigmaSync do
         pages = [['A', (1..25).map { |i| { id: "1:#{i}", name: "A#{i}", page: 'A' } }],
                  ['B', (1..3).map { |i| { id: "2:#{i}", name: "B#{i}", page: 'B' } }]]
 
-        batches = described_class.make_batches(pages, 'png', nil)
+        batches = described_class.make_batches(pages, 'png')
 
         expect(batches.map { |name, items| [name, items.size] }).to eq([['A', 20], ['A', 5], ['B', 3]])
         expect(batches.first.last.first).to eq(['1:1', 'A/A1__1-1.png'])
       end
     end
+  end
 
+  describe '.limit_frames' do
     context 'when a limit is given' do
-      it 'stops after that many frames across pages' do
-        pages = [['A', [{ id: '1:1', name: 'a', page: 'A' }]],
-                 ['B', [{ id: '2:1', name: 'b', page: 'B' }, { id: '2:2', name: 'c', page: 'B' }]],
-                 ['C', [{ id: '3:1', name: 'd', page: 'C' }]]]
+      it 'keeps the first frames in page order up to the limit' do
+        pages = [['A', [{ id: '1:1' }]], ['B', [{ id: '2:1' }, { id: '2:2' }]], ['C', [{ id: '3:1' }]]]
 
-        batches = described_class.make_batches(pages, 'png', 2)
+        limited = described_class.limit_frames(pages, 2)
 
-        expect(batches.flat_map { |_, items| items.map(&:first) }).to eq(%w[1:1 2:1])
+        expect(limited).to eq([['A', [{ id: '1:1' }]], ['B', [{ id: '2:1' }]]])
+      end
+    end
+
+    context 'when no limit is given' do
+      it 'keeps every page and frame' do
+        pages = [['A', [{ id: '1:1' }]], ['B', []]]
+
+        expect(described_class.limit_frames(pages, nil)).to eq(pages)
       end
     end
   end

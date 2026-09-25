@@ -177,6 +177,90 @@ RSpec.describe FigmaSync::Client do
     end
   end
 
+  describe '#node_documents' do
+    context 'when the API answers with node subtrees' do
+      it 'requests the ids and returns each document, nil for deleted nodes' do
+        body = '{"nodes":{"1:1":{"document":{"id":"1:1","children":[]},"components":{}},"1:2":null}}'
+        serve_http([200, {}, body]) do |base, requests|
+          stub_const('FigmaSync::Client::API_BASE', base)
+
+          documents = described_class.new('tok').node_documents('SimKey', %w[1:1 1:2])
+
+          expect(documents).to eq('1:1' => { 'id' => '1:1', 'children' => [] }, '1:2' => nil)
+          expect(requests.first[:line]).to eq('GET /v1/files/SimKey/nodes?ids=1%3A1%2C1%3A2&geometry=paths HTTP/1.1')
+        end
+      end
+    end
+  end
+
+  describe '#node_documents with deep subtrees' do
+    context 'when a subtree is nested more than 100 levels deep' do
+      it 'parses it' do
+        deep = (1..150).reduce({ 'id' => 'leaf' }) { |child, i| { 'id' => "g#{i}", 'children' => [child] } }
+        body = JSON.generate({ 'nodes' => { '1:1' => { 'document' => deep } } }, max_nesting: false)
+        serve_http([200, {}, body]) do |base, _requests|
+          stub_const('FigmaSync::Client::API_BASE', base)
+
+          documents = described_class.new('tok').node_documents('SimKey', %w[1:1])
+
+          expect(documents['1:1']['id']).to eq('g150')
+        end
+      end
+    end
+  end
+
+  describe 'read timeouts' do
+    context 'when the server accepts but never answers' do
+      it 'raises a TransientError caused by Net::ReadTimeout' do
+        server = TCPServer.new('127.0.0.1', 0)
+        held = []
+        acceptor = Thread.new { loop { held << server.accept } }
+        stub_const('FigmaSync::Client::API_BASE', "http://127.0.0.1:#{server.addr[1]}")
+        stub_const('FigmaSync::Client::READ_TIMEOUT', 0.2)
+
+        expect { described_class.new('tok').node_documents('SimKey', %w[1:1]) }
+          .to raise_error(FigmaSync::TransientError) { |error| expect(error.cause).to be_a(Net::ReadTimeout) }
+      ensure
+        acceptor&.kill
+        held&.each(&:close)
+        server&.close
+      end
+    end
+  end
+
+  describe 'connection reuse' do
+    context 'when two API calls go to the same host' do
+      it 'sends both over one kept-alive connection' do
+        serve_keep_alive('{"version":"v1"}', '{"version":"v1"}') do |base, stats|
+          stub_const('FigmaSync::Client::API_BASE', base)
+          client = described_class.new('tok')
+
+          client.get_file('SimKey', depth: 1)
+          client.get_file('SimKey', depth: 4)
+
+          expect(stats[:requests]).to eq(['/v1/files/SimKey?depth=1', '/v1/files/SimKey?depth=4'])
+          expect(stats[:connections]).to eq(1)
+        end
+      end
+    end
+
+    context 'when two images are downloaded from the same host' do
+      it 'sends both over one kept-alive connection' do
+        serve_keep_alive('png one', 'png two') do |base, stats|
+          Dir.mktmpdir do |dir|
+            client = described_class.new('tok')
+
+            client.download("#{base}/a.png", File.join(dir, 'a.png'))
+            client.download("#{base}/b.png", File.join(dir, 'b.png'))
+
+            expect(File.read(File.join(dir, 'b.png'))).to eq('png two')
+            expect(stats[:connections]).to eq(1)
+          end
+        end
+      end
+    end
+  end
+
   describe '#image_urls' do
     context 'when the API answers with images' do
       it 'requests ids, format and scale and returns the id => url map' do

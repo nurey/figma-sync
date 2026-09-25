@@ -3,7 +3,7 @@
 ## What it does
 
 Mirrors every visible top-level frame of a Figma file (including frames inside sections) to `<out>/<page>/<frame>__<node-id>.<format>`, calling the Figma REST API directly.
-Re-runs update changed frames, move renamed ones, and delete the exported files of frames that were removed. State lives in `<out>/.figma-sync.json`.
+Re-runs export only frames whose content changed or that are new, move renamed ones, and delete the exported files of frames that were removed. State lives in `<out>/.figma-sync.json`.
 If the file's version hasn't changed since the last complete run, it prints `Up to date (version …)` and exits without exporting anything.
 Hidden frames and separator pages (pages named only with dashes or spaces) are skipped. So are frames Figma can't render (for example, empty ones): they are listed at the end of the run, and any earlier export of them is removed from the mirror.
 
@@ -46,7 +46,7 @@ figma-sync <file-key-or-url> [--out DIR] [--scale N] [--format png|svg|jpg|pdf] 
 figma-sync -h
 ```
 
-`--out` defaults to `~/Figma/<file name>/`, and `--scale` defaults to 2. Do a dry run first. It lists every frame with its target path, plus the stale files it would delete, and writes nothing:
+`--out` defaults to `~/Figma/<file name>/`, and `--scale` defaults to 2. Do a dry run first. It prints how many frames changed, are new or are unchanged, lists the frames it would export, the unchanged files it would rename and the stale files it would delete, and writes nothing. To tell what changed it does the same hashing pass as a real run (see below), so on a large file it takes minutes and downloads over a gigabyte:
 
 ```bash
 figma-sync https://www.figma.com/design/<file-key>/... --dry-run
@@ -54,6 +54,19 @@ figma-sync <file-key>
 ```
 
 `--force` re-exports everything even when the version hasn't changed. Changing `--scale` or `--format` also forces a full export.
+
+## How changes are detected
+
+Figma re-renders every frame after any edit to the file, which is slow (20–90 s per batch of 20 frames), so figma-sync only exports frames whose content changed:
+
+- When the file's version changes, it fetches each frame's complete node tree, including vector path geometry, 20 frames per request to `/v1/files/<key>/nodes?geometry=paths`, and hashes it. That is about 8 s and 20–75 MB per request, or roughly 8 minutes and 2.5 GB for a 1,000-frame file. The whole-file endpoint can't be used: Figma rejects it as too large for big files.
+- The hash is a SHA-256 of the frame's node tree as canonical JSON (keys sorted). Any change inside the frame, however deeply nested and including reshaped vector paths, changes it. The frame's own name is left out, so renaming a frame moves its file instead of exporting it again.
+- A frame is exported if it is new, its hash differs from the one in the manifest, or its file is missing. Otherwise its file is kept, and moved if the frame or its page was renamed.
+- If Figma refuses a hashing request or it times out, figma-sync splits it in halves, retrying only single frames. Frames it still can't hash get a warning and are exported, so one bad frame doesn't stop the sync. After three such failures in a run it stops hashing and exports the remaining frames without a hash. If Figma keeps rate limiting the hashing requests, the run stops with exit status 1 before changing anything, and the next run tries again.
+
+The manifest (`"manifestVersion": 2`) stores `{"path": …, "hash": …}` for each frame. Older manifests that store only a path are upgraded in place: every frame is exported once on the next run, then compared by hash from then on.
+
+Upgrade every copy of the script that syncs a folder at the same time. An older copy rejects a version 2 manifest as invalid, and this copy rejects a manifest from a newer version.
 
 ## Run it on a schedule (macOS launchd)
 
