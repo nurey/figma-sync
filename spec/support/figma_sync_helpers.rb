@@ -37,7 +37,8 @@ module FigmaSyncHelpers
     meta = { 'name' => 'Sim file', 'version' => version, 'lastModified' => '2026-09-25T00:00:00Z' }
     allow(client).to receive(:get_file).with('SimKey', depth: 1).and_return(meta)
     allow(client).to receive(:get_file).with('SimKey', depth: 4)
-                                       .and_return(meta.merge('document' => { 'children' => pages }))
+                                       .and_return(meta.merge('document' => truncate_depth({ 'children' => pages }, 4)))
+    allow(client).to receive(:node_documents) { |_key, ids| ids.to_h { |id| [id, find_node(pages, id)] } }
     allow(client).to receive(:image_urls) do |_key, ids, **|
       ids.to_h { |id| [id, images.fetch(id, "https://images.example/#{id}")] }
     end
@@ -47,6 +48,26 @@ module FigmaSyncHelpers
     end
     allow(FigmaSync::Client).to receive(:new).with('tok').and_return(client)
     client
+  end
+
+  def truncate_depth(node, depth)
+    return node.except('children') if depth.zero?
+
+    node.merge('children' => node.fetch('children', []).map { truncate_depth(_1, depth - 1) })
+  end
+
+  def find_node(nodes, id)
+    nodes.each do |node|
+      return node if node['id'] == id
+
+      found = find_node(node.fetch('children', []), id)
+      return found if found
+    end
+    nil
+  end
+
+  def entry(path, document)
+    { 'path' => path, 'hash' => FigmaSync.content_hash(document) }
   end
 
   def seed_manifest(out, nodes:, version: 'v1', file_key: 'SimKey', scale: 2.0, format: 'png')
@@ -63,6 +84,10 @@ module FigmaSyncHelpers
 
   def read_manifest(out)
     JSON.parse(File.read(File.join(out, '.figma-sync.json'), encoding: 'UTF-8'))
+  end
+
+  def manifest_paths(out)
+    read_manifest(out).fetch('nodes').transform_values { |entry| entry['path'] }
   end
 
   def files_under(out)
@@ -123,6 +148,35 @@ module FigmaSyncHelpers
     yield "http://127.0.0.1:#{server.addr[1]}", requests
   ensure
     thread&.kill
+    server&.close
+  end
+
+  # Unlike serve_http, connections stay open between requests, so a client that reuses its
+  # session shows up as one connection.
+  def serve_keep_alive(*bodies)
+    server = TCPServer.new('127.0.0.1', 0)
+    stats = { connections: 0, requests: [] }
+    handlers = []
+    acceptor = Thread.new do
+      loop do
+        socket = server.accept
+        stats[:connections] += 1
+        handlers << Thread.new(socket) do |conn|
+          while (line = conn.gets)
+            nil while (header = conn.gets) && header != "\r\n"
+            stats[:requests] << line.split[1]
+            body = bodies.fetch(stats[:requests].size - 1)
+            conn.write("HTTP/1.1 200 OK\r\nContent-Length: #{body.bytesize}\r\n\r\n#{body}")
+          end
+        ensure
+          conn.close
+        end
+      end
+    end
+    yield "http://127.0.0.1:#{server.addr[1]}", stats
+  ensure
+    acceptor&.kill
+    handlers&.each(&:kill)
     server&.close
   end
 

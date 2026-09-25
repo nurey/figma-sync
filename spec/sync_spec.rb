@@ -15,12 +15,14 @@ RSpec.describe FigmaSync do
           expect(result.code).to eq(0)
           expect(files_under(out)).to eq(%w[.figma-sync.json Mobile/Cart__1-3.png Mobile/Home__1-2.png])
           expect(File.read(File.join(out, 'Mobile/Home__1-2.png'))).to eq('image from https://images.example/1:2')
-          expect(manifest.keys).to eq(%w[fileKey version lastModified syncedAt scale format nodes])
+          expect(manifest.keys).to eq(%w[fileKey manifestVersion version lastModified syncedAt scale format nodes])
           expect(manifest).to include('fileKey' => 'SimKey', 'version' => 'v2', 'scale' => 2.0, 'format' => 'png',
                                       'lastModified' => '2026-09-25T00:00:00Z')
           expect(manifest['syncedAt']).to match(/\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00\z/)
-          expect(manifest['nodes']).to eq('1:2' => 'Mobile/Home__1-2.png', '1:3' => 'Mobile/Cart__1-3.png')
-          expect(result.stderr).to include("Fetching Sim file (depth 4)...\n[1/1] Mobile: 2 frames\n",
+          expect(manifest['manifestVersion']).to eq(2)
+          expect(manifest_paths(out)).to eq('1:2' => 'Mobile/Home__1-2.png', '1:3' => 'Mobile/Cart__1-3.png')
+          expect(result.stderr).to include("Fetching Sim file (depth 4)...\nHashing 2 frames in 1 requests...\n",
+                                           "2 frames: 0 changed, 2 new, 0 unchanged\n[1/1] Mobile: 2 frames\n",
                                            "Exported 2 frames to #{out} (deleted 0 stale)")
         end
       end
@@ -45,7 +47,7 @@ RSpec.describe FigmaSync do
           end
 
           expect(files_under(out)).to eq(['.figma-sync.json', '🟡 Café/Accueil é__1-1.png', '🟡 Café/Menu ☕__1-2.png'])
-          expect(read_manifest(out)['nodes']).to eq('1:1' => '🟡 Café/Accueil é__1-1.png', '1:2' => '🟡 Café/Menu ☕__1-2.png')
+          expect(manifest_paths(out)).to eq('1:1' => '🟡 Café/Accueil é__1-1.png', '1:2' => '🟡 Café/Menu ☕__1-2.png')
         end
       end
     end
@@ -146,7 +148,7 @@ RSpec.describe FigmaSync do
     end
 
     context 'when --dry-run is given' do
-      it 'prints the plan and writes nothing' do
+      it 'prints the plan for the frames within --limit and writes nothing' do
         Dir.mktmpdir do |parent|
           out = File.join(parent, 'mirror')
           stub_figma(pages: [page('P', frame('1:1', 'A'), frame('1:2', 'B'))])
@@ -154,8 +156,9 @@ RSpec.describe FigmaSync do
           result = run_cli('SimKey', '--token', 'tok', '--out', out, '--dry-run', '--limit', '1')
 
           expect(result.code).to eq(0)
-          expect(result.stdout).to include("P (2 frames)\n  A  ->  P/A__1-1.png\n  B  ->  P/B__1-2.png  (skipped: --limit)\n",
-                                           "1 pages with frames, 2 frames\nWould export 1 frames in 1 batches\n")
+          expect(result.stdout).to eq("Output: #{out}\n1 frames: 0 changed, 1 new, 0 unchanged\n" \
+                                      "Would export 1 frames in 1 batches\n  P/A__1-1.png  (new)\n" \
+                                      "Would delete 0 stale file(s) for removed frames\n")
           expect(File.exist?(out)).to be(false)
         end
       end
@@ -173,7 +176,8 @@ RSpec.describe FigmaSync do
           expect(result.code).to eq(1)
           expect(result.stderr).to include('    failed after retries: 1:2 (download from images.example returned HTTP 403)',
                                            '1 frame(s) failed: 1:2')
-          expect(read_manifest(out)).to include('version' => nil, 'nodes' => { '1:1' => 'P/A__1-1.png' })
+          expect(read_manifest(out)['version']).to be_nil
+          expect(manifest_paths(out)).to eq('1:1' => 'P/A__1-1.png')
         end
       end
     end
@@ -193,7 +197,7 @@ RSpec.describe FigmaSync do
     end
 
     context 'when a limited run is repeated' do
-      it 'exports again because the version was left null' do
+      it 'checks again because the version was left null, but exports nothing unchanged' do
         Dir.mktmpdir do |out|
           client = stub_figma(pages: [page('P', frame('1:1', 'A'))])
           run_cli('SimKey', '--token', 'tok', '--out', out, '--limit', '1')
@@ -201,7 +205,8 @@ RSpec.describe FigmaSync do
           result = run_cli('SimKey', '--token', 'tok', '--out', out, '--limit', '1')
 
           expect(result.stdout).not_to include('Up to date')
-          expect(client).to have_received(:image_urls).twice
+          expect(result.stderr).to include('1 frames: 0 changed, 0 new, 1 unchanged')
+          expect(client).to have_received(:image_urls).once
         end
       end
     end
@@ -218,7 +223,7 @@ RSpec.describe FigmaSync do
           expect(result.stderr).to include('(deleted 1 stale)')
           expect(files_under(out)).to eq(%w[.figma-sync.json P/A__1-1.png])
           expect(Dir.exist?(File.join(out, 'Old'))).to be(false)
-          expect(read_manifest(out)['nodes']).to eq('1:1' => 'P/A__1-1.png')
+          expect(manifest_paths(out)).to eq('1:1' => 'P/A__1-1.png')
         end
       end
     end
@@ -249,7 +254,7 @@ RSpec.describe FigmaSync do
 
           expect(result.stderr).to include('(deleted 1 stale)')
           expect(files_under(out)).to eq(%w[.figma-sync.json Mobile/Landing__1-2.png])
-          expect(read_manifest(out)['nodes']).to eq('1:2' => 'Mobile/Landing__1-2.png')
+          expect(manifest_paths(out)).to eq('1:2' => 'Mobile/Landing__1-2.png')
         end
       end
     end
@@ -270,8 +275,8 @@ RSpec.describe FigmaSync do
           expect(Dir.children(out).sort).to eq(%w[.figma-sync.json mobile])
           expect(Dir.children(File.join(out, 'mobile')).sort).to eq(%w[Cart__1-3.png home__1-2.png])
           expect(File.read(File.join(out, 'mobile/home__1-2.png'))).to eq('image from https://images.example/1:2')
-          expect(read_manifest(out)).to include('version' => 'v2',
-                                                'nodes' => { '1:2' => 'mobile/home__1-2.png', '1:3' => 'mobile/Cart__1-3.png' })
+          expect(read_manifest(out)['version']).to eq('v2')
+          expect(manifest_paths(out)).to eq('1:2' => 'mobile/home__1-2.png', '1:3' => 'mobile/Cart__1-3.png')
         end
       end
     end
@@ -304,7 +309,8 @@ RSpec.describe FigmaSync do
           expect(result.code).to eq(0)
           expect(waits).to eq([])
           expect(result.stderr).to include('1 frame(s) rendered nothing and were skipped: 1:4')
-          expect(read_manifest(out)).to include('version' => 'v2', 'nodes' => { '1:1' => 'P/A__1-1.png' })
+          expect(read_manifest(out)['version']).to eq('v2')
+          expect(manifest_paths(out)).to eq('1:1' => 'P/A__1-1.png')
         end
       end
     end
@@ -356,6 +362,21 @@ RSpec.describe FigmaSync do
       end
     end
 
+    context 'when the manifest was written by a newer version of the script' do
+      it 'exits 1 asking to upgrade' do
+        Dir.mktmpdir do |out|
+          File.write(File.join(out, '.figma-sync.json'), JSON.generate('fileKey' => 'SimKey', 'manifestVersion' => 3, 'nodes' => {}))
+          stub_figma(pages: [page('P', frame('1:1', 'A'))])
+
+          result = run_cli('SimKey', '--token', 'tok', '--out', out)
+
+          expect(result.code).to eq(1)
+          expect(result.stderr).to eq("figma-sync: #{out}/.figma-sync.json was written by a newer figma-sync " \
+                                      "(manifestVersion 3); upgrade this copy of the script\n")
+        end
+      end
+    end
+
     context 'when the manifest is not JSON' do
       it 'exits 1 asking to fix or delete it' do
         Dir.mktmpdir do |out|
@@ -398,7 +419,7 @@ RSpec.describe FigmaSync do
           expect(File.read(victim)).to eq('keep me')
           expect(result.stderr).to include(%(warning: not deleting "../victim.txt"; it is outside #{out}),
                                            %(warning: not deleting "#{victim}"; it is outside #{out}))
-          expect(read_manifest(out)['nodes']).to eq('1:1' => 'P/A__1-1.png')
+          expect(manifest_paths(out)).to eq('1:1' => 'P/A__1-1.png')
         end
       end
     end
@@ -416,7 +437,8 @@ RSpec.describe FigmaSync do
           expect(result.code).to eq(1)
           expect(result.stderr).to end_with("figma-sync: Figma API returned HTTP 403 (Invalid token)\n")
           expect(files_under(out)).to include('Old/Gone__9-9.png')
-          expect(read_manifest(out)).to include('version' => nil, 'nodes' => { '9:9' => 'Old/Gone__9-9.png' })
+          expect(read_manifest(out)['version']).to be_nil
+          expect(manifest_paths(out)).to eq('9:9' => 'Old/Gone__9-9.png')
         end
       end
     end
