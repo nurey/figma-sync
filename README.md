@@ -9,9 +9,9 @@ Hidden frames and separator pages (pages named only with dashes or spaces) are s
 
 ## Annotations
 
-Dev Mode annotations are written next to each frame's image as `<frame>__<node-id>.annotations.md`: the frame name as the heading, then each annotated layer as `## <number>. <layer name> (<node id>)` with its annotation text (Markdown when Figma provides it) and the names of any pinned properties. Annotations on hidden layers are left out. A frame with no annotations gets no file, and the file is deleted when its last annotation is removed.
+Dev Mode annotations are written next to each frame's image as `<frame>__<node-id>.annotations.md`: the frame name as the heading, then each annotated layer as `## <layer name> (<node id>)` with its annotation text (Markdown when Figma provides it) and the names of any pinned properties. Annotations on hidden layers are left out. A frame with no annotations gets no file, and the file is deleted when its last annotation is removed.
 
-Figma doesn't draw annotations in exported images, so for png and jpg exports figma-sync also draws `<frame>__<node-id>.annotated.<format>` with ImageMagick: the exported image with each annotated layer outlined and a numbered badge on its top-left corner, and the numbered notes in a panel on the right. The numbers match the `.annotations.md` headings. The clean image is left as it is. svg and pdf exports get no annotated copy.
+Figma doesn't draw annotations in exported images, so for png and jpg exports figma-sync also draws `<frame>__<node-id>.annotated.<format>` with ImageMagick: the exported image on a dark canvas with each note in a callout to the right, as in Figma: callouts run top to bottom, each centred on its layer where there is room, with a dashed line to a dot on the layer's right edge. The clean image is left as it is. svg and pdf exports get no annotated copy.
 
 The annotated copy is drawn again when the image is exported or the annotation text changes, and is otherwise only moved along with the image.
 
@@ -22,6 +22,7 @@ An edit that only touches annotations rewrites the `.annotations.md` file and re
 - macOS or Linux.
 - Ruby 3.3+, via rbenv or Homebrew: `ruby --version`. Only the standard library is used, so running it needs no gems (the tests use RSpec).
 - ImageMagick 7, to draw annotated copies of frames (see [Annotations](#annotations)): `brew install imagemagick`, then check with `magick -version`. figma-sync exits with an error before contacting Figma if `magick` isn't on `PATH`. The tests need it too.
+- Optional: the Inter font (`brew install --cask font-inter`), which Figma draws annotations in. Without it, annotated copies use Helvetica, or DejaVu Sans on Linux.
 - A Figma personal access token. Generate one at <https://www.figma.com/settings> (Security → Personal access tokens → Generate new token), with the `File content: read` scope; the scopes are documented at <https://www.figma.com/developers/api#access-tokens>.
 
 ## Store the token

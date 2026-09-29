@@ -38,11 +38,11 @@ RSpec.describe FigmaSync do
         expect(described_class.annotations_markdown(document)).to eq(<<~MD)
           # Checkout
 
-          ## 1. Checkout (1:1)
+          ## Checkout (1:1)
 
           Whole screen is a modal
 
-          ## 2. Title (1:3)
+          ## Title (1:3)
 
           Truncate at 40 characters
 
@@ -59,7 +59,7 @@ RSpec.describe FigmaSync do
         expect(described_class.annotations_markdown(document)).to eq(<<~MD)
           # A
 
-          ## 1. A (1:1)
+          ## A (1:1)
 
           **Bold**
 
@@ -72,7 +72,7 @@ RSpec.describe FigmaSync do
       it 'lists just the properties' do
         document = frame('1:1', 'A', annotations: [{ 'properties' => [{ 'type' => 'height' }] }])
 
-        expect(described_class.annotations_markdown(document)).to end_with("## 1. A (1:1)\n\nProperties: height\n")
+        expect(described_class.annotations_markdown(document)).to end_with("## A (1:1)\n\nProperties: height\n")
       end
     end
 
@@ -107,7 +107,7 @@ RSpec.describe FigmaSync do
           expect(result.code).to eq(0)
           expect(files_under(out)).to eq(['.figma-sync.json', 'P/A__1-1.annotations.md', 'P/A__1-1.png',
                                           'P/B__1-2.png'])
-          expect(File.read(File.join(out, 'P/A__1-1.annotations.md'))).to eq("# A\n\n## 1. Logo (1:10)\n\nUse SVG\n")
+          expect(File.read(File.join(out, 'P/A__1-1.annotations.md'))).to eq("# A\n\n## Logo (1:10)\n\nUse SVG\n")
           expect(read_manifest(out)['nodes']).to eq(
             '1:1' => entry('P/A__1-1.png', annotated_frame('1:1', 'A', 'Use SVG'))
                      .merge('annotations' => 'P/A__1-1.annotations.md'),
@@ -144,7 +144,7 @@ RSpec.describe FigmaSync do
 
           run_cli('SimKey', '--token', 'tok', '--out', out)
 
-          expect(File.read(File.join(out, 'P/A__1-1.annotations.md'))).to eq("# A\n\n## 1. Logo (1:10)\n\nUse PNG\n")
+          expect(File.read(File.join(out, 'P/A__1-1.annotations.md'))).to eq("# A\n\n## Logo (1:10)\n\nUse PNG\n")
         end
       end
     end

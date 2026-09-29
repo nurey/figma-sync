@@ -19,16 +19,17 @@ module FigmaSync
   MANIFEST_NAME = '.figma-sync.json'
   ANNOTATIONS_SUFFIX = '.annotations.md'
   DRAWABLE_FORMATS = %w[png jpg].freeze
-  MARKER_COLOR = '#F24822'
-  NOTE_COLOR = '#1D1D1F'
-  MARKER_RADIUS = 10
-  MARKER_STROKE = 2
-  MARKER_TEXT_SIZE = 12
-  NOTE_TEXT_SIZE = 14
-  NOTES_WIDTH = 320
-  NOTES_PADDING = 16
-  FONTS = %w[/System/Library/Fonts/Helvetica.ttc /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
-             /usr/share/fonts/dejavu/DejaVuSans.ttf].freeze
+  CALLOUT = { width: 300, padding: 12, gap: 10, margin: 20, radius: 10, text_size: 15, line_spacing: 5, dot: 3,
+              line: 1, dash: 4, border: 1 }.freeze
+  CANVAS_COLOR = '#3C3C3C'
+  CALLOUT_COLOR = '#2C2C2C'
+  CALLOUT_BORDER_COLOR = '#4D4D4D'
+  CALLOUT_TEXT_COLOR = '#F5F5F5'
+  LEADER_COLOR = '#8C8C8C'
+  LEADER_HALO_COLOR = '#FFFFFF99'
+  FONTS = ['~/Library/Fonts/Inter-Regular.otf', '/Library/Fonts/Inter-Regular.otf',
+           '/usr/share/fonts/opentype/inter/Inter-Regular.otf', '/System/Library/Fonts/Helvetica.ttc',
+           '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', '/usr/share/fonts/dejavu/DejaVuSans.ttf'].freeze
   MAGICK_REQUIRED = 'ImageMagick 7 is required to draw annotated images, but magick is not on PATH; ' \
                     'install it with: brew install imagemagick'
   MANIFEST_VERSION = 2
@@ -478,12 +479,25 @@ module FigmaSync
       size = run_quiet(['magick', 'identify', '-format', '%w %h', "#{source}[0]"])&.split&.map(&:to_i)
       return drawing_failed(source, 'cannot read the image') unless size&.size == 2
 
-      font = FONTS.find { File.exist?(_1) }
-      _stdout, stderr, status = Open3.capture3(*annotated_image_command(source, dest, drawing, size, font))
+      font = annotation_font
+      factor = drawing[:width] ? size.first.fdiv(drawing[:width]) : 1
+      style = CALLOUT.transform_values { (_1 * factor).round }
+      markers = drawing[:markers].map { |marker| marker.merge(box: marker[:box]&.map { (_1 * factor).round }) }
+      texts = markers.map { _1[:text] }
+      heights = run_quiet(callout_measure_command(texts, style, font))&.split&.map(&:to_i)
+      return drawing_failed(source, 'cannot measure the notes') unless heights&.size == texts.size
+
+      layout = callout_layout(markers, size, heights, style)
+      _stdout, stderr, status = Open3.capture3(*callout_image_command(source, dest, layout, style, font))
       return true if status.success?
 
       FileUtils.rm_f(dest)
       drawing_failed(source, utf8(stderr).lines.first.to_s.strip)
+    end
+
+    # Figma draws annotations in Inter; the rest are fallbacks for machines without it.
+    def annotation_font
+      FONTS.map { expand_user(_1) }.find { File.exist?(_1) }
     end
 
     def drawing_failed(source, reason)
@@ -491,32 +505,55 @@ module FigmaSync
       false
     end
 
-    def annotated_image_command(source, dest, drawing, size, font)
+    # Like Figma's canvas: callouts sit in a gutter right of the frame, ordered top to bottom, each
+    # centred on its layer when there is room, with a leader to the layer's right edge. Boxes are in pixels.
+    def callout_layout(markers, size, heights, style)
       width, height = size
-      factor = drawing[:width] ? width.fdiv(drawing[:width]) : 1
-      px = ->(value) { (value * factor).round }
-      markers = drawing[:markers].select { _1[:box] }.flat_map { marker_command(_1, px, width, height) }
-      ['magick', source, '-gravity', 'Center', *(['-font', font] if font), *markers,
-       *notes_command(drawing[:markers], px), '-background', 'white', '-gravity', 'NorthWest', '+append', dest]
+      left = width + style[:margin]
+      bottom = style[:margin] - style[:gap]
+      placed = markers.zip(heights).map do |marker, text_height|
+        { marker:, box: marker[:box], height: text_height - style[:line_spacing] + (2 * style[:padding]) }
+      end
+      ordered = placed.each_with_index.sort_by do |item, index|
+        [item[:box] ? item[:box][1] + (item[:box][3] / 2.0) - (item[:height] / 2.0) : Float::INFINITY, index]
+      end
+      callouts = ordered.map do |item, _|
+        box = item[:box]
+        desired = box ? box[1] + (box[3] / 2) - (item[:height] / 2) : bottom
+        top = [desired, bottom + style[:gap]].max
+        bottom = top + item[:height]
+        middle = top + (item[:height] / 2)
+        leader = box && [box[0] + box[2], middle.clamp(box[1], box[1] + box[3]), left, middle]
+        { rect: [left, top, left + style[:width], bottom], text_at: [left + style[:padding], top + style[:padding]],
+          text: item[:marker][:text], leader: }
+      end
+      { canvas: [left + style[:width] + style[:margin], [height, bottom + style[:margin]].max], callouts: }
     end
 
-    def marker_command(marker, scaled, width, height)
-      radius = scaled[MARKER_RADIUS]
-      x, y, w, h = marker[:box].map(&scaled)
-      cx = x.clamp(radius, width - radius)
-      cy = y.clamp(radius, height - radius)
-      ['-fill', 'none', '-stroke', MARKER_COLOR, '-strokewidth', scaled[MARKER_STROKE].to_s,
-       '-draw', "rectangle #{x},#{y} #{x + w},#{y + h}",
-       '-fill', MARKER_COLOR, '-stroke', 'none', '-draw', "circle #{cx},#{cy} #{cx + radius},#{cy}",
-       '-fill', 'white', '-pointsize', scaled[MARKER_TEXT_SIZE].to_s,
-       '-annotate', format('%<dx>+d%<dy>+d', dx: cx - (width / 2), dy: cy - (height / 2)), marker[:number].to_s]
+    def callout_measure_command(texts, style, font)
+      ['magick', *(['-font', font] if font), '-pointsize', style[:text_size].to_s,
+       '-interline-spacing', style[:line_spacing].to_s, '-size', "#{style[:width] - (2 * style[:padding])}x", *texts.map { "caption:#{magick_text(_1)}" },
+       '-format', "%h\n", 'info:']
     end
 
-    def notes_command(markers, scaled)
-      notes = markers.map { "#{_1[:number]}. #{_1[:text]}" }.join("\n\n")
-      ['(', '-size', "#{scaled[NOTES_WIDTH]}x", '-background', 'white', '-fill', NOTE_COLOR, '-gravity', 'NorthWest',
-       '-pointsize', scaled[NOTE_TEXT_SIZE].to_s, "caption:#{magick_text(notes)}",
-       '-bordercolor', 'white', '-border', scaled[NOTES_PADDING].to_s, ')']
+    def callout_image_command(source, dest, layout, style, font)
+      leaders = layout[:callouts].filter_map { _1[:leader] }.flat_map do |x1, y1, x2, y2|
+        ['-fill', 'none', '-stroke', LEADER_HALO_COLOR, '-strokewidth', (style[:line] * 3).to_s,
+         '-draw', "line #{x1},#{y1} #{x2},#{y2}",
+         '-stroke', LEADER_COLOR, '-strokewidth', style[:line].to_s,
+         '-draw', "stroke-dasharray #{style[:dash]} #{style[:dash]} line #{x1},#{y1} #{x2},#{y2}",
+         '-fill', LEADER_COLOR, '-stroke', 'none', '-draw', "circle #{x1},#{y1} #{x1 + style[:dot]},#{y1}"]
+      end
+      callouts = layout[:callouts].flat_map do |callout|
+        x1, y1, x2, y2 = callout[:rect]
+        ['-fill', CALLOUT_COLOR, '-stroke', CALLOUT_BORDER_COLOR, '-strokewidth', style[:border].to_s,
+         '-draw', "roundrectangle #{x1},#{y1} #{x2},#{y2} #{style[:radius]},#{style[:radius]}",
+         '(', '-size', "#{style[:width] - (2 * style[:padding])}x", '-background', 'none', '-fill', CALLOUT_TEXT_COLOR, '-stroke', 'none',
+         '-pointsize', style[:text_size].to_s, '-interline-spacing', style[:line_spacing].to_s, "caption:#{magick_text(callout[:text])}", ')',
+         '-geometry', "+#{callout[:text_at][0]}+#{callout[:text_at][1]}", '-composite']
+      end
+      ['magick', source, *(['-font', font] if font), '-background', CANVAS_COLOR, '-gravity', 'NorthWest',
+       '-extent', layout[:canvas].join('x'), *leaders, *callouts, dest]
     end
 
     # ImageMagick expands % escapes and backslash sequences in caption text.
@@ -647,9 +684,9 @@ module FigmaSync
     end
 
     def annotations_markdown(document)
-      sections = annotated_nodes(document).map.with_index(1) do |node, number|
+      sections = annotated_nodes(document).map do |node|
         notes = node['annotations'].map { annotation_text(_1) }.reject(&:empty?)
-        "## #{number}. #{node['name']} (#{node['id']})\n\n#{notes.join("\n\n")}\n"
+        "## #{node['name']} (#{node['id']})\n\n#{notes.join("\n\n")}\n"
       end
       sections.empty? ? nil : "# #{document['name']}\n\n#{sections.join("\n")}"
     end
@@ -660,11 +697,11 @@ module FigmaSync
       return nil if nodes.empty?
 
       origin = document['absoluteRenderBounds'] || document['absoluteBoundingBox'] || {}
-      markers = nodes.map.with_index(1) do |node, number|
+      markers = nodes.map do |node|
         bounds = node['absoluteBoundingBox']
         box = bounds && [bounds['x'] - origin['x'], bounds['y'] - origin['y'], bounds['width'], bounds['height']]
         text = node['annotations'].map { annotation_text(_1, markdown: false) }.reject(&:empty?).join("\n")
-        { number:, box:, text: }
+        { box:, text: }
       end
       { width: origin['width'], markers: }
     end
