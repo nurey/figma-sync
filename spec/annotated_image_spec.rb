@@ -3,6 +3,11 @@
 require 'spec_helper'
 
 RSpec.describe FigmaSync do
+  def style
+    { width: 280, padding: 12, gap: 8, margin: 24, radius: 8, text_size: 14, line_spacing: 4, dot: 3, line: 1,
+      dash: 4, border: 1 }
+  end
+
   def box(x, y, width, height)
     { 'x' => x, 'y' => y, 'width' => width, 'height' => height }
   end
@@ -23,10 +28,10 @@ RSpec.describe FigmaSync do
 
   describe '.annotation_drawing' do
     context 'when a layer inside the frame is annotated' do
-      it 'gives the frame width and the numbered layer box relative to the frame' do
+      it 'gives the frame width and the layer box relative to the frame' do
         drawing = described_class.annotation_drawing(boxed_frame('1:1', 'A', 'Use SVG'))
 
-        expect(drawing).to eq(width: 400, markers: [{ number: 1, box: [50, 60, 40, 20], text: 'Use SVG' }])
+        expect(drawing).to eq(width: 400, markers: [{ box: [50, 60, 40, 20], text: 'Use SVG' }])
       end
     end
 
@@ -35,7 +40,7 @@ RSpec.describe FigmaSync do
         document = boxed_frame('1:1', 'A', 'Use SVG', absoluteRenderBounds: box(90, 190, 420, 320))
 
         expect(described_class.annotation_drawing(document))
-          .to eq(width: 420, markers: [{ number: 1, box: [60, 70, 40, 20], text: 'Use SVG' }])
+          .to eq(width: 420, markers: [{ box: [60, 70, 40, 20], text: 'Use SVG' }])
       end
     end
 
@@ -46,16 +51,16 @@ RSpec.describe FigmaSync do
                                                      'properties' => [{ 'type' => 'width' }] }])
 
         expect(described_class.annotation_drawing(document)[:markers])
-          .to eq([{ number: 1, box: [0, 0, 10, 10], text: "Bold\nProperties: width" }])
+          .to eq([{ box: [0, 0, 10, 10], text: "Bold\nProperties: width" }])
       end
     end
 
     context 'when an annotated layer has no bounding box' do
-      it 'numbers it without a box' do
+      it 'gives it no box' do
         document = frame('1:1', 'A', absoluteBoundingBox: box(0, 0, 10, 10),
                                      children: [{ 'id' => '1:2', 'name' => 'Ghost', 'annotations' => [{ 'label' => 'x' }] }])
 
-        expect(described_class.annotation_drawing(document)[:markers]).to eq([{ number: 1, box: nil, text: 'x' }])
+        expect(described_class.annotation_drawing(document)[:markers]).to eq([{ box: nil, text: 'x' }])
       end
     end
 
@@ -66,82 +71,174 @@ RSpec.describe FigmaSync do
     end
   end
 
-  describe '.annotated_image_command' do
-    context 'when the image is exported at twice the frame size' do
-      it 'outlines the layer, puts a numbered badge on its corner and appends the notes' do
-        drawing = { width: 400, markers: [{ number: 1, box: [50, 60, 40, 20], text: 'Use SVG' }] }
+  describe '.callout_layout' do
+    def flat_style
+      style.merge(line_spacing: 0)
+    end
 
-        command = described_class.annotated_image_command('in.png', 'out.png', drawing, [800, 600], '/f.ttc')
+    def marker(box, text = 'x')
+      { box:, text: }
+    end
 
-        expect(command).to eq(['magick', 'in.png', '-gravity', 'Center', '-font', '/f.ttc',
-                               '-fill', 'none', '-stroke', '#F24822', '-strokewidth', '4',
-                               '-draw', 'rectangle 100,120 180,160',
-                               '-fill', '#F24822', '-stroke', 'none', '-draw', 'circle 100,120 120,120',
-                               '-fill', 'white', '-pointsize', '24', '-annotate', '-300-180', '1',
-                               '(', '-size', '640x', '-background', 'white', '-fill', '#1D1D1F', '-gravity', 'NorthWest',
-                               '-pointsize', '28',
-                               'caption:1. Use SVG', '-bordercolor', 'white', '-border', '32', ')',
-                               '-background', 'white', '-gravity', 'NorthWest', '+append', 'out.png'])
+    context 'when one layer is annotated' do
+      it 'centres the callout on the layer and draws the leader from its right edge' do
+        layout = described_class.callout_layout([marker([50, 60, 40, 20], 'Use SVG')], [400, 300], [32], flat_style)
+
+        expect(layout).to eq(canvas: [728, 300],
+                             callouts: [{ rect: [424, 42, 704, 98], text_at: [436, 54], text: 'Use SVG',
+                                          leader: [90, 70, 424, 70] }])
       end
     end
 
-    context 'when a layer sits in the corner of the image' do
-      it 'keeps the badge inside the image' do
-        drawing = { width: 400, markers: [{ number: 1, box: [0, 0, 10, 10], text: 'x' }] }
+    context 'when two callouts would overlap' do
+      it 'pushes the lower one down and keeps its leader inside the layer' do
+        layout = described_class.callout_layout([marker([50, 60, 40, 20]), marker([50, 60, 40, 20])],
+                                                [400, 300], [32, 32], flat_style)
 
-        command = described_class.annotated_image_command('in.png', 'out.png', drawing, [400, 300], nil)
-
-        expect(command).to include('circle 10,10 20,10', '-190-140')
-        expect(command).not_to include('-font')
+        expect(layout[:callouts].map { _1[:rect] }).to eq([[424, 42, 704, 98], [424, 106, 704, 162]])
+        expect(layout[:callouts].last[:leader]).to eq([90, 80, 424, 134])
       end
     end
 
-    context 'when a marker has no box' do
-      it 'lists the note without drawing a badge' do
-        drawing = { width: 400, markers: [{ number: 1, box: nil, text: 'x' }] }
+    context 'when the layers are out of order in the tree' do
+      it 'orders the callouts top to bottom' do
+        layout = described_class.callout_layout([marker([0, 200, 10, 10], 'low'), marker([0, 10, 10, 10], 'high')],
+                                                [400, 300], [16, 16], flat_style)
 
-        command = described_class.annotated_image_command('in.png', 'out.png', drawing, [400, 300], nil)
-
-        expect(command.grep(/circle|rectangle/)).to eq([])
-        expect(command).to include('caption:1. x')
+        expect(layout[:callouts].map { _1[:text] }).to eq(%w[high low])
       end
     end
 
-    context 'when the note text contains ImageMagick escapes' do
-      it 'escapes them so the text is drawn literally' do
-        drawing = { width: 400, markers: [{ number: 1, box: nil, text: '50% off \\n' },
-                                          { number: 2, box: nil, text: 'second' }] }
+    context 'when a layer is near the top of the image' do
+      it 'keeps the callout inside the margin' do
+        layout = described_class.callout_layout([marker([0, 0, 10, 10])], [400, 300], [16], flat_style)
 
-        command = described_class.annotated_image_command('in.png', 'out.png', drawing, [400, 300], nil)
-
-        expect(command).to include("caption:1. 50%% off \\\\n\n\n2. second")
+        expect(layout[:callouts].first[:rect]).to eq([424, 24, 704, 64])
       end
     end
 
-    context 'when the frame width is unknown' do
-      it 'draws at one pixel per unit' do
-        drawing = { width: nil, markers: [{ number: 1, box: [50, 60, 40, 20], text: 'x' }] }
+    context 'when a layer has no box' do
+      it 'puts its callout after the others without a leader' do
+        layout = described_class.callout_layout([marker(nil, 'loose'), marker([0, 100, 10, 10], 'placed')],
+                                                [400, 300], [16, 16], flat_style)
 
-        command = described_class.annotated_image_command('in.png', 'out.png', drawing, [400, 300], nil)
+        expect(layout[:callouts].map { [_1[:text], _1[:rect][1], _1[:leader]] })
+          .to eq([['placed', 85, [10, 105, 424, 105]], ['loose', 133, nil]])
+      end
+    end
 
-        expect(command).to include('rectangle 50,60 90,80')
+    context 'when the callouts run past the bottom of the image' do
+      it 'makes the canvas taller' do
+        layout = described_class.callout_layout([marker([0, 250, 10, 10])], [400, 300], [200], flat_style)
+
+        expect(layout[:canvas]).to eq([728, 391])
+      end
+    end
+  
+    context 'when the text has line spacing' do
+      it 'drops the spacing ImageMagick adds after the last line' do
+        layout = described_class.callout_layout([marker(nil)], [400, 300], [20], style)
+
+        expect(layout[:callouts].first[:rect]).to eq([424, 24, 704, 64])
+      end
+    end
+  end
+
+  describe '.callout_measure_command' do
+    context 'when a font is available' do
+      it 'measures every callout text in one call, escaped' do
+        command = described_class.callout_measure_command(['a', '50% \\n'], style, '/f.ttc')
+
+        expect(command).to eq(['magick', '-font', '/f.ttc', '-pointsize', '14', '-interline-spacing', '4',
+                               '-size', '256x', 'caption:a',
+                               'caption:50%% \\\\n', '-format', "%h\n", 'info:'])
+      end
+    end
+
+    context 'when no font is available' do
+      it 'leaves the font to ImageMagick' do
+        expect(described_class.callout_measure_command(['a'], style, nil)).not_to include('-font')
+      end
+    end
+  end
+
+  describe '.callout_image_command' do
+    context 'when there is one callout' do
+      it 'extends the canvas, draws the leader and dot, the callout box, then its text' do
+        layout = { canvas: [728, 300], callouts: [{ rect: [424, 42, 704, 98], text_at: [436, 54], text: 'Use SVG',
+                                                    leader: [90, 70, 424, 70] }] }
+
+        command = described_class.callout_image_command('in.png', 'out.png', layout, style, '/f.ttc')
+
+        expect(command).to eq(['magick', 'in.png', '-font', '/f.ttc', '-background', '#3C3C3C',
+                               '-gravity', 'NorthWest', '-extent', '728x300',
+                               '-fill', 'none', '-stroke', '#FFFFFF99', '-strokewidth', '3',
+                               '-draw', 'line 90,70 424,70', '-stroke', '#8C8C8C', '-strokewidth', '1',
+                               '-draw', 'stroke-dasharray 4 4 line 90,70 424,70',
+                               '-fill', '#8C8C8C', '-stroke', 'none', '-draw', 'circle 90,70 93,70',
+                               '-fill', '#2C2C2C', '-stroke', '#4D4D4D', '-strokewidth', '1',
+                               '-draw', 'roundrectangle 424,42 704,98 8,8',
+                               '(', '-size', '256x', '-background', 'none', '-fill', '#F5F5F5', '-stroke', 'none',
+                               '-pointsize', '14',
+                               '-interline-spacing', '4', 'caption:Use SVG', ')', '-geometry', '+436+54', '-composite',
+                               'out.png'])
+      end
+    end
+
+    context 'when a callout has no leader and there is no font' do
+      it 'draws only the callout' do
+        layout = { canvas: [728, 300], callouts: [{ rect: [424, 24, 704, 64], text_at: [436, 36], text: 'x',
+                                                    leader: nil }] }
+
+        command = described_class.callout_image_command('in.png', 'out.png', layout, style, nil)
+
+        expect(command.grep(/stroke-dasharray|circle|\A-font\z/)).to eq([])
+      end
+    end
+  end
+
+  describe '.annotation_font' do
+    context 'when Inter is installed for the user' do
+      it 'uses Inter, the font Figma draws annotations in' do
+        inter = File.join(Dir.home, 'Library/Fonts/Inter-Regular.otf')
+        allow(File).to receive(:exist?).and_call_original
+        allow(File).to receive(:exist?).with(inter).and_return(true)
+
+        expect(described_class.annotation_font).to eq(inter)
+      end
+    end
+
+    context 'when only Helvetica is available' do
+      it 'falls back to Helvetica' do
+        allow(File).to receive(:exist?).and_return(false)
+        allow(File).to receive(:exist?).with('/System/Library/Fonts/Helvetica.ttc').and_return(true)
+
+        expect(described_class.annotation_font).to eq('/System/Library/Fonts/Helvetica.ttc')
+      end
+    end
+
+    context 'when no known font is installed' do
+      it 'returns nil so ImageMagick picks one' do
+        allow(File).to receive(:exist?).and_return(false)
+
+        expect(described_class.annotation_font).to be_nil
       end
     end
   end
 
   describe '.draw_annotations' do
     context 'when ImageMagick draws the image' do
-      it 'writes the annotated image, wider than the source by the notes panel' do
+      it 'writes the annotated image, wider than the source by the callout gutter' do
         spec_tmpdir do |dir|
           source = File.join(dir, 'in.png')
           system('magick', '-size', '800x600', 'xc:gray', source, exception: true)
-          drawing = { width: 400, markers: [{ number: 1, box: [50, 60, 40, 20], text: 'Use SVG' }] }
+          drawing = { width: 400, markers: [{ box: [50, 60, 40, 20], text: 'Use SVG' }] }
 
           drawn = described_class.draw_annotations(source, File.join(dir, 'out.png'), drawing)
 
           expect(drawn).to be(true)
           expect(FigmaSync.run_quiet(['magick', 'identify', '-format', '%w %h', File.join(dir, 'out.png')]))
-            .to eq('1504 600')
+            .to eq('1480 600')
         end
       end
     end
@@ -164,18 +261,35 @@ RSpec.describe FigmaSync do
       end
     end
 
+    context 'when the callout text cannot be measured' do
+      it 'warns and returns false' do
+        allow(described_class).to receive(:run_quiet).and_return('800 600', nil)
+        stderr = StringIO.new
+        $stderr = stderr
+
+        drawn = described_class.draw_annotations('/x/in.png', '/x/out.png',
+                                                 { width: 1, markers: [{ box: nil, text: 'x' }] })
+
+        expect(drawn).to be(false)
+        expect(stderr.string).to eq("warning: could not draw annotations on in.png (cannot measure the notes)\n")
+      ensure
+        $stderr = STDERR
+      end
+    end
+
     context 'when drawing fails' do
       it 'warns with the ImageMagick error, removes any partial output and returns false' do
         spec_tmpdir do |dir|
           dest = File.join(dir, 'out.png')
           File.write(dest, 'partial')
-          allow(described_class).to receive(:run_quiet).and_return('800 600')
+          allow(described_class).to receive(:run_quiet).and_return('800 600', "16\n")
           allow(Open3).to receive(:capture3).and_return(['', "magick: boom\nmore\n",
                                                          instance_double(Process::Status, success?: false)])
           stderr = StringIO.new
           $stderr = stderr
 
-          drawn = described_class.draw_annotations(File.join(dir, 'in.png'), dest, { width: 1, markers: [] })
+          drawn = described_class.draw_annotations(File.join(dir, 'in.png'), dest,
+                                                   { width: 1, markers: [{ box: nil, text: 'x' }] })
 
           expect(drawn).to be(false)
           expect(File.exist?(dest)).to be(false)
@@ -199,7 +313,7 @@ RSpec.describe FigmaSync do
           expect(result.code).to eq(0)
           expect(described_class).to have_received(:draw_annotations)
             .once.with(File.join(out, 'P/A__1-1.png'), File.join(out, 'P/A__1-1.annotated.png'),
-                       { width: 400, markers: [{ number: 1, box: [50, 60, 40, 20], text: 'Use SVG' }] })
+                       { width: 400, markers: [{ box: [50, 60, 40, 20], text: 'Use SVG' }] })
           expect(files_under(out)).to eq(['.figma-sync.json', 'P/A__1-1.annotated.png', 'P/A__1-1.annotations.md',
                                           'P/A__1-1.png', 'P/B__1-2.png'])
           expect(read_manifest(out).dig('nodes', '1:1', 'annotated')).to eq('P/A__1-1.annotated.png')
