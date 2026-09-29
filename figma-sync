@@ -17,6 +17,20 @@ module FigmaSync
   MAX_NAME_BYTES = 100
   FETCH_DEPTH = 4
   MANIFEST_NAME = '.figma-sync.json'
+  ANNOTATIONS_SUFFIX = '.annotations.md'
+  DRAWABLE_FORMATS = %w[png jpg].freeze
+  MARKER_COLOR = '#F24822'
+  NOTE_COLOR = '#1D1D1F'
+  MARKER_RADIUS = 10
+  MARKER_STROKE = 2
+  MARKER_TEXT_SIZE = 12
+  NOTE_TEXT_SIZE = 14
+  NOTES_WIDTH = 320
+  NOTES_PADDING = 16
+  FONTS = %w[/System/Library/Fonts/Helvetica.ttc /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+             /usr/share/fonts/dejavu/DejaVuSans.ttf].freeze
+  MAGICK_REQUIRED = 'ImageMagick 7 is required to draw annotated images, but magick is not on PATH; ' \
+                    'install it with: brew install imagemagick'
   MANIFEST_VERSION = 2
   SPLITTABLE_STATUSES = [400, 413, 500, 502, 503, 504].freeze
   MAX_HASH_FAILURES = 3
@@ -65,6 +79,7 @@ module FigmaSync
     def sync(options)
       key = parse_file_key(options[:file])
       client = Client.new(resolve_token(options[:token]))
+      raise SyncError, MAGICK_REQUIRED unless run_quiet(%w[magick -version])
 
       meta = client.get_file(key, depth: 1)
       out = options[:out] ? expand_user(options[:out]) : File.join(home_dir, 'Figma', sanitize(meta['name']))
@@ -89,12 +104,12 @@ module FigmaSync
       previous_nodes = manifest_entries((previous || {}).fetch('nodes', {}))
       stale = previous_nodes.reject { |node_id, _| current_ids.include?(node_id) }.sort_by { |_, entry| entry['path'] }
       considered = limit_frames(pages, options[:limit])
-      hashes = hash_frames(client, key, considered.flat_map(&:last))
+      digests = hash_frames(client, key, considered.flat_map(&:last))
       rerender = if options[:force] then '--force'
                  elsif previous && (previous['scale'] != options[:scale] || previous['format'] != options[:format])
                    'scale or format changed'
                  end
-      plan = plan_frames(considered, previous_nodes, hashes, out, options[:format], rerender)
+      plan = plan_frames(considered, previous_nodes, digests, out, options[:format], rerender)
       batches = make_batches(plan[:export_pages], options[:format])
       summary = plan_summary(plan, rerender)
 
@@ -126,7 +141,7 @@ module FigmaSync
       begin
         plan[:carry].each do |frame|
           move_file(out, frame[:old], frame[:rel]) if frame[:old] != frame[:rel]
-          nodes[frame[:id]] = { 'path' => frame[:rel], 'hash' => frame[:hash] }
+          nodes[frame[:id]] = frame_entry(out, frame[:rel], digests[frame[:id]], nodes[frame[:id]], exported: false)
         end
         batches.each.with_index(1) do |(page_name, items), index|
           log("[#{index}/#{batches.size}] #{page_name.strip}: #{items.size} frames")
@@ -141,7 +156,7 @@ module FigmaSync
                 removed += 1
               end
             end
-            nodes[node_id] = { 'path' => rel, 'hash' => hashes[node_id] }
+            nodes[node_id] = frame_entry(out, rel, digests[node_id], nodes[node_id], exported: true)
           end
           exported_count += exported.size
           skipped.concat(batch_skipped)
@@ -149,7 +164,7 @@ module FigmaSync
             next unless nodes.key?(node_id)
 
             unrenderable << nodes[node_id]['path'] if remove_file(out, nodes[node_id]['path']) == :removed
-            nodes.delete(node_id)
+            remove_annotations(out, nodes.delete(node_id))
           end
           next if batch_failed.empty?
 
@@ -158,6 +173,7 @@ module FigmaSync
         end
         stale.each do |node_id, entry|
           removed += 1 if remove_file(out, entry['path']) == :removed
+          remove_annotations(out, entry)
           nodes.delete(node_id)
         end
         complete = true
@@ -396,11 +412,138 @@ module FigmaSync
     def valid_entry?(entry)
       return true if entry.is_a?(String)
 
-      entry.is_a?(Hash) && entry['path'].is_a?(String) && (entry['hash'].nil? || entry['hash'].is_a?(String))
+      entry.is_a?(Hash) && entry['path'].is_a?(String) &&
+        entry.values_at('hash', 'annotations', 'annotated').all? { _1.nil? || _1.is_a?(String) }
     end
 
     def manifest_entries(nodes)
-      nodes.transform_values { _1.is_a?(String) ? { 'path' => _1, 'hash' => nil } : _1.slice('path', 'hash') }
+      nodes.transform_values do
+        _1.is_a?(String) ? { 'path' => _1, 'hash' => nil } : _1.slice('path', 'hash', 'annotations', 'annotated')
+      end
+    end
+
+    def frame_entry(out, rel, digest, previous, exported:)
+      previous ||= {}
+      notes_changed = digest && notes_body(read_text(out, previous['annotations'])) != notes_body(digest[:annotations])
+      annotations = sync_annotations(out, rel.sub(%r{\.[^./]+\z}, ANNOTATIONS_SUFFIX), digest, previous['annotations'])
+      annotated = sync_annotated_image(out, rel, digest, previous['annotated'], redraw: exported || notes_changed)
+      { 'path' => rel, 'hash' => digest&.fetch(:hash), 'annotations' => annotations, 'annotated' => annotated }
+        .reject { |name, value| value.nil? && name != 'hash' }
+    end
+
+    # Annotations are not in the hash, so they are rewritten from every frame hashed this run.
+    # A frame that could not be hashed keeps the annotations file it had.
+    def sync_annotations(out, rel, digest, old)
+      return keep_annotations(out, rel, old) if digest.nil?
+
+      markdown = digest[:annotations]
+      remove_file(out, old) if old && (markdown.nil? || old != rel)
+      return nil unless markdown
+
+      write_text(out, rel, markdown)
+      rel
+    end
+
+    def keep_annotations(out, rel, old)
+      return nil unless old && file_present?(out, old)
+
+      move_file(out, old, rel) if old != rel
+      rel
+    end
+
+    # The annotated copy is drawn from the exported image, so it is redrawn whenever the image is
+    # exported or the annotations change, and otherwise only moved along with the image.
+    def sync_annotated_image(out, image_rel, digest, old, redraw:)
+      rel = image_rel.sub(%r{(\.[^./]+)\z}, '.annotated\\1')
+      drawing = digest && drawable?(rel) ? digest[:drawing] : nil
+      return keep_annotations(out, rel, old) if digest.nil?
+
+      return remove_annotated(out, old) unless drawing
+      return keep_annotations(out, rel, old) if !redraw && old && file_present?(out, old)
+
+      remove_file(out, old) if old && old != rel
+      draw_annotations(contained_path(out, image_rel), contained_path(out, rel), drawing) ? rel : nil
+    end
+
+    def remove_annotated(out, old)
+      remove_file(out, old) if old
+      nil
+    end
+
+    def drawable?(rel)
+      DRAWABLE_FORMATS.include?(File.extname(rel).delete_prefix('.'))
+    end
+
+    def draw_annotations(source, dest, drawing)
+      size = run_quiet(['magick', 'identify', '-format', '%w %h', "#{source}[0]"])&.split&.map(&:to_i)
+      return drawing_failed(source, 'cannot read the image') unless size&.size == 2
+
+      font = FONTS.find { File.exist?(_1) }
+      _stdout, stderr, status = Open3.capture3(*annotated_image_command(source, dest, drawing, size, font))
+      return true if status.success?
+
+      FileUtils.rm_f(dest)
+      drawing_failed(source, utf8(stderr).lines.first.to_s.strip)
+    end
+
+    def drawing_failed(source, reason)
+      log("warning: could not draw annotations on #{File.basename(source)} (#{reason})")
+      false
+    end
+
+    def annotated_image_command(source, dest, drawing, size, font)
+      width, height = size
+      factor = drawing[:width] ? width.fdiv(drawing[:width]) : 1
+      px = ->(value) { (value * factor).round }
+      markers = drawing[:markers].select { _1[:box] }.flat_map { marker_command(_1, px, width, height) }
+      ['magick', source, '-gravity', 'Center', *(['-font', font] if font), *markers,
+       *notes_command(drawing[:markers], px), '-background', 'white', '-gravity', 'NorthWest', '+append', dest]
+    end
+
+    def marker_command(marker, scaled, width, height)
+      radius = scaled[MARKER_RADIUS]
+      x, y, w, h = marker[:box].map(&scaled)
+      cx = x.clamp(radius, width - radius)
+      cy = y.clamp(radius, height - radius)
+      ['-fill', 'none', '-stroke', MARKER_COLOR, '-strokewidth', scaled[MARKER_STROKE].to_s,
+       '-draw', "rectangle #{x},#{y} #{x + w},#{y + h}",
+       '-fill', MARKER_COLOR, '-stroke', 'none', '-draw', "circle #{cx},#{cy} #{cx + radius},#{cy}",
+       '-fill', 'white', '-pointsize', scaled[MARKER_TEXT_SIZE].to_s,
+       '-annotate', format('%<dx>+d%<dy>+d', dx: cx - (width / 2), dy: cy - (height / 2)), marker[:number].to_s]
+    end
+
+    def notes_command(markers, scaled)
+      notes = markers.map { "#{_1[:number]}. #{_1[:text]}" }.join("\n\n")
+      ['(', '-size', "#{scaled[NOTES_WIDTH]}x", '-background', 'white', '-fill', NOTE_COLOR, '-gravity', 'NorthWest',
+       '-pointsize', scaled[NOTE_TEXT_SIZE].to_s, "caption:#{magick_text(notes)}",
+       '-bordercolor', 'white', '-border', scaled[NOTES_PADDING].to_s, ')']
+    end
+
+    # ImageMagick expands % escapes and backslash sequences in caption text.
+    def magick_text(text)
+      text.gsub('\\', '\\\\\\\\').gsub('%', '%%')
+    end
+
+    def remove_annotations(out, entry)
+      entry.values_at('annotations', 'annotated').compact.each { remove_file(out, _1) }
+    end
+
+    # The title is the frame name, which the annotated copy does not show.
+    def notes_body(markdown)
+      markdown&.sub(/\A# .*\n/, '')
+    end
+
+    def read_text(out, rel)
+      path = rel && contained_path(out, rel)
+      path && File.file?(path) ? File.read(path, encoding: Encoding::UTF_8) : nil
+    end
+
+    def write_text(out, rel, text)
+      path = contained_path(out, rel)
+      return if File.file?(path) && File.read(path, encoding: Encoding::UTF_8) == text
+
+      FileUtils.mkdir_p(File.dirname(path))
+      File.write(path, text, encoding: Encoding::UTF_8)
     end
 
     def write_manifest(out, manifest)
@@ -438,7 +581,7 @@ module FigmaSync
         result.merge!(chunk)
         next if state[:skipped] - skipped_before == ids.size
 
-        hashed = ids.count { chunk[_1] }
+        hashed = ids.count { chunk[_1]&.fetch(:hash) }
         log("  [#{index}/#{chunks.size}] hashed #{hashed == ids.size ? hashed : "#{hashed} of #{ids.size}"} frames")
       end
       if state[:skipped].positive?
@@ -462,7 +605,7 @@ module FigmaSync
 
       retry_if = ids.size > 1 ? ->(e) { e.status == 429 } : nil
       documents = with_retries("#{ids.size} node(s)", retry_if:) { client.node_documents(key, ids) }
-      documents.transform_values { content_hash(_1) }
+      documents.transform_values { frame_digest(_1) }
     rescue AuthError
       raise
     rescue SyncError => e
@@ -480,29 +623,73 @@ module FigmaSync
       ids.to_h { [_1, nil] }
     end
 
+    def frame_digest(document)
+      document && { hash: content_hash(document), annotations: annotations_markdown(document),
+                    drawing: annotation_drawing(document) }
+    end
+
     def splittable?(error)
       SPLITTABLE_STATUSES.include?(error.status) || error.cause.is_a?(Net::ReadTimeout)
     end
 
-    # The root's name is excluded so that renaming a frame moves its file instead of re-rendering it.
+    # The root's name is excluded so that renaming a frame moves its file instead of re-rendering it,
+    # and annotations are excluded because Figma does not render them.
     def content_hash(document)
       document && Digest::SHA256.hexdigest(JSON.generate(canonical(document.except('name')), max_nesting: false))
     end
 
     def canonical(value)
       case value
-      when Hash then value.keys.sort.to_h { |k| [k, canonical(value[k])] }
+      when Hash then (value.keys - ['annotations']).sort.to_h { |k| [k, canonical(value[k])] }
       when Array then value.map { canonical(_1) }
       else value
       end
     end
 
-    def plan_frames(pages, entries, hashes, out, fmt, rerender)
+    def annotations_markdown(document)
+      sections = annotated_nodes(document).map.with_index(1) do |node, number|
+        notes = node['annotations'].map { annotation_text(_1) }.reject(&:empty?)
+        "## #{number}. #{node['name']} (#{node['id']})\n\n#{notes.join("\n\n")}\n"
+      end
+      sections.empty? ? nil : "# #{document['name']}\n\n#{sections.join("\n")}"
+    end
+
+    # Boxes are in design units relative to the frame's render bounds, the area the exported image covers.
+    def annotation_drawing(document)
+      nodes = annotated_nodes(document)
+      return nil if nodes.empty?
+
+      origin = document['absoluteRenderBounds'] || document['absoluteBoundingBox'] || {}
+      markers = nodes.map.with_index(1) do |node, number|
+        bounds = node['absoluteBoundingBox']
+        box = bounds && [bounds['x'] - origin['x'], bounds['y'] - origin['y'], bounds['width'], bounds['height']]
+        text = node['annotations'].map { annotation_text(_1, markdown: false) }.reject(&:empty?).join("\n")
+        { number:, box:, text: }
+      end
+      { width: origin['width'], markers: }
+    end
+
+    def annotated_nodes(node, found = [])
+      return found if hidden?(node)
+
+      found << node if node['annotations']&.any?
+      node.fetch('children', []).each { annotated_nodes(_1, found) }
+      found
+    end
+
+    def annotation_text(annotation, markdown: true)
+      properties = annotation.fetch('properties', []).map { _1['type'] }
+      label = markdown ? annotation['labelMarkdown'] || annotation['label'] : annotation['label']
+      [label, ("Properties: #{properties.join(', ')}" if properties.any?)].compact.join(markdown ? "\n\n" : "\n")
+    end
+
+    def plan_frames(pages, entries, digests, out, fmt, rerender)
       plan = { new: [], changed: [], unchanged: [] }
       export_pages = pages.map do |page_name, frames|
         exporting = frames.select do |frame|
           entry = entries[frame[:id]]
-          item = frame.merge(rel: relative_path(frame, fmt), hash: hashes[frame[:id]], old: entry&.fetch('path'))
+          item = frame.merge(rel: relative_path(frame, fmt), hash: digests[frame[:id]]&.fetch(:hash),
+                             old: entry&.fetch('path'))
           status = frame_status(entry, item[:hash], out)
           plan[status] << item
           rerender || status != :unchanged

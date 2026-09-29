@@ -7,10 +7,21 @@ Re-runs export only frames whose content changed or that are new, move renamed o
 If the file's version hasn't changed since the last complete run, it prints `Up to date (version …)` and exits without exporting anything.
 Hidden frames and separator pages (pages named only with dashes or spaces) are skipped. So are frames Figma can't render (for example, empty ones): they are listed at the end of the run, and any earlier export of them is removed from the mirror.
 
+## Annotations
+
+Dev Mode annotations are written next to each frame's image as `<frame>__<node-id>.annotations.md`: the frame name as the heading, then each annotated layer as `## <number>. <layer name> (<node id>)` with its annotation text (Markdown when Figma provides it) and the names of any pinned properties. Annotations on hidden layers are left out. A frame with no annotations gets no file, and the file is deleted when its last annotation is removed.
+
+Figma doesn't draw annotations in exported images, so for png and jpg exports figma-sync also draws `<frame>__<node-id>.annotated.<format>` with ImageMagick: the exported image with each annotated layer outlined and a numbered badge on its top-left corner, and the numbered notes in a panel on the right. The numbers match the `.annotations.md` headings. The clean image is left as it is. svg and pdf exports get no annotated copy.
+
+The annotated copy is drawn again when the image is exported or the annotation text changes, and is otherwise only moved along with the image.
+
+An edit that only touches annotations rewrites the `.annotations.md` file and redraws the annotated copy, without exporting the image again. A folder synced before annotations were exported gets its files on the first run after the Figma file next changes (or with `--force`, which also re-exports every image).
+
 ## Prerequisites
 
 - macOS or Linux.
 - Ruby 3.3+, via rbenv or Homebrew: `ruby --version`. Only the standard library is used, so running it needs no gems (the tests use RSpec).
+- ImageMagick 7, to draw annotated copies of frames (see [Annotations](#annotations)): `brew install imagemagick`, then check with `magick -version`. figma-sync exits with an error before contacting Figma if `magick` isn't on `PATH`. The tests need it too.
 - A Figma personal access token. Generate one at <https://www.figma.com/settings> (Security → Personal access tokens → Generate new token), with the `File content: read` scope; the scopes are documented at <https://www.figma.com/developers/api#access-tokens>.
 
 ## Store the token
@@ -60,11 +71,11 @@ figma-sync <file-key>
 Figma re-renders every frame after any edit to the file, which is slow (20–90 s per batch of 20 frames), so figma-sync only exports frames whose content changed:
 
 - When the file's version changes, it fetches each frame's complete node tree, including vector path geometry, 20 frames per request to `/v1/files/<key>/nodes?geometry=paths`, and hashes it. That is about 8 s and 20–75 MB per request, or roughly 8 minutes and 2.5 GB for a 1,000-frame file. The whole-file endpoint can't be used: Figma rejects it as too large for big files.
-- The hash is a SHA-256 of the frame's node tree as canonical JSON (keys sorted). Any change inside the frame, however deeply nested and including reshaped vector paths, changes it. The frame's own name is left out, so renaming a frame moves its file instead of exporting it again.
+- The hash is a SHA-256 of the frame's node tree as canonical JSON (keys sorted). Any change inside the frame, however deeply nested and including reshaped vector paths, changes it. The frame's own name is left out, so renaming a frame moves its file instead of exporting it again. Annotations are left out too (see [Annotations](#annotations)); after upgrading, frames that have annotations are exported once more.
 - A frame is exported if it is new, its hash differs from the one in the manifest, or its file is missing. Otherwise its file is kept, and moved if the frame or its page was renamed.
 - If Figma refuses a hashing request or it times out, figma-sync splits it in halves, retrying only single frames. Frames it still can't hash get a warning and are exported, so one bad frame doesn't stop the sync. After three such failures in a run it stops hashing and exports the remaining frames without a hash. If Figma keeps rate limiting the hashing requests, the run stops with exit status 1 before changing anything, and the next run tries again.
 
-The manifest (`"manifestVersion": 2`) stores `{"path": …, "hash": …}` for each frame. Older manifests that store only a path are upgraded in place: every frame is exported once on the next run, then compared by hash from then on.
+The manifest (`"manifestVersion": 2`) stores `{"path": …, "hash": …}` for each frame, plus `"annotations": …` with the path of its annotations file when it has one. Older manifests that store only a path are upgraded in place: every frame is exported once on the next run, then compared by hash from then on.
 
 Upgrade every copy of the script that syncs a folder at the same time. An older copy rejects a version 2 manifest as invalid, and this copy rejects a manifest from a newer version.
 
