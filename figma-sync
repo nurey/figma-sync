@@ -105,6 +105,7 @@ module FigmaSync
       previous_nodes = manifest_entries((previous || {}).fetch('nodes', {}))
       stale = previous_nodes.reject { |node_id, _| current_ids.include?(node_id) }.sort_by { |_, entry| entry['path'] }
       considered = limit_frames(pages, options[:limit])
+      sections = considered.flat_map(&:last).to_h { [_1[:id], _1[:sections]] }
       digests = hash_frames(client, key, considered.flat_map(&:last))
       rerender = if options[:force] then '--force'
                  elsif previous && (previous['scale'] != options[:scale] || previous['format'] != options[:format])
@@ -142,7 +143,8 @@ module FigmaSync
       begin
         plan[:carry].each do |frame|
           move_file(out, frame[:old], frame[:rel]) if frame[:old] != frame[:rel]
-          nodes[frame[:id]] = frame_entry(out, frame[:rel], digests[frame[:id]], nodes[frame[:id]], exported: false)
+          nodes[frame[:id]] = frame_entry(out, frame[:rel], digests[frame[:id]], nodes[frame[:id]],
+                                          sections: frame[:sections], exported: false)
         end
         batches.each.with_index(1) do |(page_name, items), index|
           log("[#{index}/#{batches.size}] #{page_name.strip}: #{items.size} frames")
@@ -157,7 +159,8 @@ module FigmaSync
                 removed += 1
               end
             end
-            nodes[node_id] = frame_entry(out, rel, digests[node_id], nodes[node_id], exported: true)
+            nodes[node_id] = frame_entry(out, rel, digests[node_id], nodes[node_id],
+                                         sections: sections[node_id], exported: true)
           end
           exported_count += exported.size
           skipped.concat(batch_skipped)
@@ -354,19 +357,19 @@ module FigmaSync
       node['visible'] == false || node['opacity']&.zero?
     end
 
-    def collect_frames(node, page_name, frames)
+    def collect_frames(node, page_name, frames, sections = [])
       node.fetch('children', []).each do |child|
         next if hidden?(child)
 
         case child['type']
         when 'FRAME'
-          frames << { id: child['id'], name: child['name'], page: page_name }
+          frames << { id: child['id'], name: child['name'], page: page_name, sections: }
         when 'SECTION'
           unless child.key?('children')
             log("warning: section #{child['name'].inspect} on #{page_name.inspect} is nested deeper than the " \
                 "#{FETCH_DEPTH} levels fetched; its frames are not exported")
           end
-          collect_frames(child, page_name, frames)
+          collect_frames(child, page_name, frames, [*sections, { id: child['id'], name: child['name'] }])
         end
       end
     end
@@ -414,22 +417,34 @@ module FigmaSync
       return true if entry.is_a?(String)
 
       entry.is_a?(Hash) && entry['path'].is_a?(String) &&
-        entry.values_at('hash', 'annotations', 'annotated').all? { _1.nil? || _1.is_a?(String) }
+        entry.values_at('hash', 'annotations', 'annotated').all? { _1.nil? || _1.is_a?(String) } &&
+        valid_sections?(entry['sections'])
+    end
+
+    def valid_sections?(sections)
+      sections.nil? ||
+        (sections.is_a?(Array) && sections.all? { _1.is_a?(Hash) && _1.values_at('id', 'name').all?(String) })
     end
 
     def manifest_entries(nodes)
       nodes.transform_values do
-        _1.is_a?(String) ? { 'path' => _1, 'hash' => nil } : _1.slice('path', 'hash', 'annotations', 'annotated')
+        _1.is_a?(String) ? { 'path' => _1, 'hash' => nil } : _1.slice('path', 'hash', 'annotations', 'annotated', 'sections')
       end
     end
 
-    def frame_entry(out, rel, digest, previous, exported:)
+    def frame_entry(out, rel, digest, previous, sections:, exported:)
       previous ||= {}
       notes_changed = digest && notes_body(read_text(out, previous['annotations'])) != notes_body(digest[:annotations])
       annotations = sync_annotations(out, rel.sub(%r{\.[^./]+\z}, ANNOTATIONS_SUFFIX), digest, previous['annotations'])
       annotated = sync_annotated_image(out, rel, digest, previous['annotated'], redraw: exported || notes_changed)
-      { 'path' => rel, 'hash' => digest&.fetch(:hash), 'annotations' => annotations, 'annotated' => annotated }
+      { 'path' => rel, 'hash' => digest&.fetch(:hash), 'annotations' => annotations, 'annotated' => annotated,
+        'sections' => sections_entry(sections) }
         .reject { |name, value| value.nil? && name != 'hash' }
+    end
+
+    # valid_sections? accepts only strings, and a manifest it rejects costs a full re-export to replace.
+    def sections_entry(sections)
+      sections.map { { 'id' => _1[:id].to_s, 'name' => _1[:name].to_s } } if sections.any?
     end
 
     # Annotations are not in the hash, so they are rewritten from every frame hashed this run.
@@ -726,7 +741,7 @@ module FigmaSync
         exporting = frames.select do |frame|
           entry = entries[frame[:id]]
           item = frame.merge(rel: relative_path(frame, fmt), hash: digests[frame[:id]]&.fetch(:hash),
-                             old: entry&.fetch('path'))
+                             old: entry&.fetch('path'), old_sections: entry&.[]('sections'))
           status = frame_status(entry, item[:hash], out)
           plan[status] << item
           rerender || status != :unchanged
@@ -814,16 +829,25 @@ module FigmaSync
       !path.nil? && File.file?(path)
     end
 
+    def section_chain(sections)
+      sections ? sections.map { _1['name'] }.join(' / ') : '(none)'
+    end
+
     def print_plan(plan, batches, summary, stale)
       items = %i[new changed unchanged].flat_map { |status| plan[status].map { [_1[:id], _1.merge(status:)] } }.to_h
       exporting = batches.flat_map { |_, batch| batch.map { items.fetch(_1.first) } }
       renames = plan[:carry].reject { _1[:old] == _1[:rel] }
+      regrouped = plan[:carry].reject { _1[:old_sections] == sections_entry(_1[:sections]) }
       superseded = exporting.count { _1[:old] && _1[:old] != _1[:rel] }
       puts summary
       puts "Would export #{exporting.size} frames in #{batches.size} batches"
       exporting.each { puts "  #{_1[:rel]}  (#{_1[:status]})" }
       puts "Would rename #{renames.size} unchanged file(s)" if renames.any?
       renames.each { puts "  - #{_1[:old]}  ->  #{_1[:rel]}" }
+      puts "Would update the sections of #{regrouped.size} unchanged frame(s)" if regrouped.any?
+      regrouped.each do |frame|
+        puts "  #{frame[:rel]}: sections #{section_chain(frame[:old_sections])} -> #{section_chain(sections_entry(frame[:sections]))}"
+      end
       puts "Would delete #{stale.size} stale file(s) for removed frames" +
            (superseded.positive? ? ", plus up to #{superseded} superseded by renamed paths" : '')
       stale.each { puts "  - #{_1}" }

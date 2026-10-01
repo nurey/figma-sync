@@ -10,8 +10,33 @@ RSpec.describe FigmaSync do
 
         pages = described_class.pages_with_frames(document)
 
-        expect(pages).to eq([['Home', [{ id: '1:1', name: 'Hero', page: 'Home' },
-                                       { id: '1:2', name: 'Footer', page: 'Home' }]]])
+        expect(pages).to eq([['Home', [{ id: '1:1', name: 'Hero', page: 'Home', sections: [] },
+                                       { id: '1:2', name: 'Footer', page: 'Home', sections: [] }]]])
+      end
+    end
+
+    context 'when a frame sits inside a section' do
+      it 'records the section id and name with the frame' do
+        document = { 'children' => [page('Webhooks', section('Create a webhook', frame('1:1', 'Blank'), id: '5938:6914'),
+                                         frame('1:2', 'Loose'))] }
+
+        pages = described_class.pages_with_frames(document)
+
+        expect(pages.first.last).to eq([{ id: '1:1', name: 'Blank', page: 'Webhooks',
+                                          sections: [{ id: '5938:6914', name: 'Create a webhook' }] },
+                                        { id: '1:2', name: 'Loose', page: 'Webhooks', sections: [] }])
+      end
+    end
+
+    context 'when a frame sits inside a section nested in another section' do
+      it 'records the chain of sections from outermost to innermost' do
+        document = { 'children' => [page('P', section('Outer', frame('1:1', 'A'), section('Inner', frame('1:2', 'B'))))] }
+
+        pages = described_class.pages_with_frames(document)
+
+        expect(pages.first.last.to_h { |f| [f[:id], f[:sections]] })
+          .to eq('1:1' => [{ id: 's-Outer', name: 'Outer' }],
+                 '1:2' => [{ id: 's-Outer', name: 'Outer' }, { id: 's-Inner', name: 'Inner' }])
       end
     end
 

@@ -58,7 +58,7 @@ figma-sync <file-key-or-url> [--out DIR] [--scale N] [--format png|svg|jpg|pdf] 
 figma-sync -h
 ```
 
-`--out` defaults to `~/Figma/<file name>/`, and `--scale` defaults to 2. Do a dry run first. It prints how many frames changed, are new or are unchanged, lists the frames it would export, the unchanged files it would rename and the stale files it would delete, and writes nothing. To tell what changed it does the same hashing pass as a real run (see below), so on a large file it takes minutes and downloads over a gigabyte:
+`--out` defaults to `~/Figma/<file name>/`, and `--scale` defaults to 2. Do a dry run first. It prints how many frames changed, are new or are unchanged, lists the frames it would export, the unchanged files it would rename or whose sections changed, and the stale files it would delete, and writes nothing. To tell what changed it does the same hashing pass as a real run (see below), so on a large file it takes minutes and downloads over a gigabyte:
 
 ```bash
 figma-sync https://www.figma.com/design/<file-key>/... --dry-run
@@ -76,7 +76,7 @@ Figma re-renders every frame after any edit to the file, which is slow (20–90 
 - A frame is exported if it is new, its hash differs from the one in the manifest, or its file is missing. Otherwise its file is kept, and moved if the frame or its page was renamed.
 - If Figma refuses a hashing request or it times out, figma-sync splits it in halves, retrying only single frames. Frames it still can't hash get a warning and are exported, so one bad frame doesn't stop the sync. After three such failures in a run it stops hashing and exports the remaining frames without a hash. If Figma keeps rate limiting the hashing requests, the run stops with exit status 1 before changing anything, and the next run tries again.
 
-The manifest (`"manifestVersion": 2`) stores `{"path": …, "hash": …}` for each frame, plus `"annotations": …` with the path of its annotations file when it has one. Older manifests that store only a path are upgraded in place: every frame is exported once on the next run, then compared by hash from then on.
+The manifest (`"manifestVersion": 2`) stores `{"path": …, "hash": …}` for each frame, plus `"annotations": …` with the path of its annotations file when it has one, and `"sections": [{"id": …, "name": …}, …]` with the sections the frame sits in, outermost first, when it is in one. A folder synced before sections were recorded gets them, without exporting any image again, on the first run after the Figma file next changes; to backfill now without re-exporting, set `"version": null` in `.figma-sync.json` and run again (`--force` also records them, but re-exports every image). Older manifests that store only a path are upgraded in place: every frame is exported once on the next run, then compared by hash from then on.
 
 Upgrade every copy of the script that syncs a folder at the same time. An older copy rejects a version 2 manifest as invalid, and this copy rejects a manifest from a newer version.
 
