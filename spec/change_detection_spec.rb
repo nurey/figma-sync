@@ -168,6 +168,90 @@ RSpec.describe FigmaSync do
       end
     end
 
+    context 'when an unchanged frame moved into another section' do
+      it 'updates the sections in its entry without exporting it' do
+        Dir.mktmpdir do |out|
+          a = frame('1:1', 'A')
+          seed_manifest(out, nodes: { '1:1' => entry('P/A__1-1.png', a).merge('sections' => [{ 'id' => '7:1', 'name' => 'Old flow' }]) })
+          seed_file(out, 'P/A__1-1.png', 'old image')
+          client = stub_figma(pages: [page('P', section('New flow', a, id: '7:2'))])
+
+          result = run_cli('SimKey', '--token', 'tok', '--out', out)
+
+          expect(result.code).to eq(0)
+          expect(client).not_to have_received(:image_urls)
+          expect(File.read(File.join(out, 'P/A__1-1.png'))).to eq('old image')
+          expect(read_manifest(out)['nodes']).to eq(
+            '1:1' => entry('P/A__1-1.png', a).merge('sections' => [{ 'id' => '7:2', 'name' => 'New flow' }])
+          )
+        end
+      end
+    end
+
+    context 'when an unchanged frame was renamed and moved into another section' do
+      it 'moves its file and updates its sections without exporting it' do
+        Dir.mktmpdir do |out|
+          seed_manifest(out, nodes: { '1:1' => entry('P/Old__1-1.png', frame('1:1', 'Old'))
+                                                 .merge('sections' => [{ 'id' => '7:1', 'name' => 'Old flow' }]) })
+          seed_file(out, 'P/Old__1-1.png', 'old image')
+          renamed = frame('1:1', 'New')
+          client = stub_figma(pages: [page('P', section('Outer', section('Inner', renamed, id: '7:3'), id: '7:2'))])
+
+          run_cli('SimKey', '--token', 'tok', '--out', out)
+
+          expect(client).not_to have_received(:image_urls)
+          expect(files_under(out)).to eq(['.figma-sync.json', 'P/New__1-1.png'])
+          expect(File.read(File.join(out, 'P/New__1-1.png'))).to eq('old image')
+          expect(read_manifest(out)['nodes']).to eq(
+            '1:1' => entry('P/New__1-1.png', renamed).merge('sections' => [{ 'id' => '7:2', 'name' => 'Outer' },
+                                                                           { 'id' => '7:3', 'name' => 'Inner' }])
+          )
+        end
+      end
+    end
+
+    context 'when an unchanged frame moved out of its section' do
+      it 'drops the sections from its entry without exporting it' do
+        Dir.mktmpdir do |out|
+          a = frame('1:1', 'A')
+          seed_manifest(out, nodes: { '1:1' => entry('P/A__1-1.png', a).merge('sections' => [{ 'id' => '7:1', 'name' => 'Flow' }]) })
+          seed_file(out, 'P/A__1-1.png', 'old image')
+          client = stub_figma(pages: [page('P', a)])
+
+          run_cli('SimKey', '--token', 'tok', '--out', out)
+
+          expect(client).not_to have_received(:image_urls)
+          expect(read_manifest(out)['nodes']).to eq('1:1' => entry('P/A__1-1.png', a))
+        end
+      end
+    end
+
+    context 'when a version 2 manifest predates section tracking' do
+      it 'records the sections of unchanged frames without exporting any' do
+        Dir.mktmpdir do |out|
+          a = frame('1:1', 'A')
+          b = frame('1:2', 'B')
+          manifest = { 'fileKey' => 'SimKey', 'manifestVersion' => 2, 'version' => 'v1', 'scale' => 2.0, 'format' => 'png',
+                       'nodes' => { '1:1' => entry('P/A__1-1.png', a), '1:2' => entry('P/B__1-2.png', b) } }
+          File.write(File.join(out, '.figma-sync.json'), JSON.generate(manifest))
+          seed_file(out, 'P/A__1-1.png')
+          seed_file(out, 'P/B__1-2.png')
+          client = stub_figma(pages: [page('P', section('Create a webhook', a, id: '5938:6914'), b)], version: 'v2')
+
+          result = run_cli('SimKey', '--token', 'tok', '--out', out)
+
+          expect(result.code).to eq(0)
+          expect(result.stderr).to include('2 frames: 0 changed, 0 new, 2 unchanged')
+          expect(client).not_to have_received(:image_urls)
+          expect(read_manifest(out)).to include('manifestVersion' => 2, 'version' => 'v2')
+          expect(read_manifest(out)['nodes']).to eq(
+            '1:1' => entry('P/A__1-1.png', a).merge('sections' => [{ 'id' => '5938:6914', 'name' => 'Create a webhook' }]),
+            '1:2' => entry('P/B__1-2.png', b)
+          )
+        end
+      end
+    end
+
     context 'when an unchanged frame changed only the case of its name on a case-insensitive volume' do
       it 'fixes the case on disk without exporting it' do
         Dir.mktmpdir do |out|
@@ -427,6 +511,26 @@ RSpec.describe FigmaSync do
 
           expect(result.code).to eq(0)
           expect(read_manifest(out)['nodes']['1:1']['hash']).to match(/\A\h{64}\z/)
+        end
+      end
+    end
+
+    context 'when --dry-run is given and unchanged frames changed section' do
+      it 'prints each section change and writes nothing' do
+        Dir.mktmpdir do |out|
+          a = frame('1:1', 'A')
+          b = frame('1:2', 'B')
+          seed_manifest(out, nodes: { '1:1' => entry('P/A__1-1.png', a),
+                                      '1:2' => entry('P/B__1-2.png', b).merge('sections' => [{ 'id' => '7:1', 'name' => 'Old' }]) })
+          seed_file(out, 'P/A__1-1.png')
+          seed_file(out, 'P/B__1-2.png')
+          stub_figma(pages: [page('P', section('New', a, section('Sub', b, id: '7:3'), id: '7:2'))])
+
+          result = run_cli('SimKey', '--token', 'tok', '--out', out, '--dry-run')
+
+          expect(result.stdout).to include("Would update the sections of 2 unchanged frame(s)\n" \
+                                           "  P/A__1-1.png: sections (none) -> New\n  P/B__1-2.png: sections Old -> New / Sub\n")
+          expect(read_manifest(out)['nodes']['1:1']).not_to have_key('sections')
         end
       end
     end

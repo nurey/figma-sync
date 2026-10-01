@@ -28,6 +28,101 @@ RSpec.describe FigmaSync do
       end
     end
 
+    context 'when some frames sit inside a section' do
+      it 'stores the sections in their manifest entries and leaves them out for page-level frames' do
+        Dir.mktmpdir do |out|
+          stub_figma(pages: [page('Webhooks', section('Create a webhook', frame('1:1', 'Blank'), id: '5938:6914'),
+                                  frame('1:2', 'Loose'))])
+
+          result = run_cli('SimKey', '--token', 'tok', '--out', out)
+
+          nodes = read_manifest(out)['nodes']
+          expect(result.code).to eq(0)
+          expect(nodes['1:1']).to include('path' => 'Webhooks/Blank__1-1.png',
+                                          'sections' => [{ 'id' => '5938:6914', 'name' => 'Create a webhook' }])
+          expect(nodes['1:2']).not_to have_key('sections')
+        end
+      end
+    end
+
+    context 'when a later run leaves a sectioned frame out of the plan' do
+      it 'keeps the sections of its reloaded entry' do
+        Dir.mktmpdir do |out|
+          pages = [page('P', frame('1:1', 'A'), section('Flow', frame('1:2', 'B'), id: '7:7'))]
+          stub_figma(pages:, version: 'v1')
+          run_cli('SimKey', '--token', 'tok', '--out', out)
+          stub_figma(pages:, version: 'v2')
+
+          result = run_cli('SimKey', '--token', 'tok', '--out', out, '--limit', '1')
+
+          expect(result.code).to eq(0)
+          expect(read_manifest(out)['nodes']['1:2']).to include('sections' => [{ 'id' => '7:7', 'name' => 'Flow' }])
+        end
+      end
+    end
+
+    context 'when a Figma section has no name' do
+      it 'stores an empty name that the next run accepts' do
+        Dir.mktmpdir do |out|
+          pages = [page('P', { 'type' => 'SECTION', 'id' => '7:7', 'name' => nil, 'children' => [frame('1:1', 'A')] })]
+          stub_figma(pages:, version: 'v1')
+          run_cli('SimKey', '--token', 'tok', '--out', out)
+          stub_figma(pages:, version: 'v2')
+
+          result = run_cli('SimKey', '--token', 'tok', '--out', out)
+
+          expect(result.code).to eq(0)
+          expect(read_manifest(out)['nodes']['1:1']).to include('sections' => [{ 'id' => '7:7', 'name' => '' }])
+        end
+      end
+    end
+
+    context 'when a download fails for a frame that changed section' do
+      it 'keeps the sections of its previous entry' do
+        Dir.mktmpdir do |out|
+          seed_manifest(out, nodes: { '1:1' => { 'path' => 'P/A__1-1.png', 'hash' => 'old',
+                                                 'sections' => [{ 'id' => '7:1', 'name' => 'Old flow' }] } })
+          seed_file(out, 'P/A__1-1.png')
+          client = stub_figma(pages: [page('P', section('New flow', frame('1:1', 'A'), id: '7:2'))])
+          allow(client).to receive(:download).and_raise(FigmaSync::SyncError, 'download from images.example returned HTTP 403')
+
+          result = run_cli('SimKey', '--token', 'tok', '--out', out)
+
+          expect(result.code).to eq(1)
+          expect(read_manifest(out)['nodes']['1:1']).to include('sections' => [{ 'id' => '7:1', 'name' => 'Old flow' }])
+        end
+      end
+    end
+
+    context 'when a manifest entry has a section without a name' do
+      it 'exits 1 asking to fix or delete it' do
+        Dir.mktmpdir do |out|
+          seed_manifest(out, nodes: { '1:1' => { 'path' => 'P/A__1-1.png', 'hash' => nil, 'sections' => [{ 'id' => '7:7' }] } })
+          stub_figma(pages: [page('P', frame('1:1', 'A'))])
+
+          result = run_cli('SimKey', '--token', 'tok', '--out', out)
+
+          expect(result.code).to eq(1)
+          expect(result.stderr).to include('is not a valid figma-sync manifest')
+        end
+      end
+    end
+
+    context 'when a manifest entry has sections that are not a list' do
+      it 'exits 1 asking to fix or delete it' do
+        Dir.mktmpdir do |out|
+          seed_manifest(out, nodes: { '1:1' => { 'path' => 'P/A__1-1.png', 'hash' => nil,
+                                                 'sections' => { 'id' => '7:7', 'name' => 'Flow' } } })
+          stub_figma(pages: [page('P', frame('1:1', 'A'))])
+
+          result = run_cli('SimKey', '--token', 'tok', '--out', out)
+
+          expect(result.code).to eq(1)
+          expect(result.stderr).to include('is not a valid figma-sync manifest')
+        end
+      end
+    end
+
     context 'when the locale is US-ASCII and names contain emoji and accents' do
       it 'loads, exports, saves and reloads the manifest as UTF-8' do
         Dir.mktmpdir do |parent|
